@@ -6,7 +6,8 @@ import AgentCard from './AgentCard';
 import ChatPanel from './ChatPanel';
 import DmDrawer from './DmDrawer';
 import AddMemberDialog from './AddMemberDialog';
-import type { ParticipantView, RoomData, AgentStatus } from './types';
+import type { RoomData, AgentStatus } from './types';
+import type { MeetingEvent } from '@/lib/events';
 
 export type { ParticipantView, RoomData } from './types';
 
@@ -20,26 +21,32 @@ export default function Room({ initial }: { initial: RoomData }) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const applyEvent = useCallback((e: MessageEvent) => {
-    const data = JSON.parse(e.data);
-    if (data.type === 'message') {
-      setMessages((ms) =>
-        ms.some((m) => m.id === data.message.id) ? ms : [...ms, data.message],
-      );
-    } else if (data.type === 'agent_status') {
-      setStates((s) => ({
-        ...s,
-        [data.participantId]: { status: data.status, detail: data.detail },
-      }));
-    } else if (data.type === 'participant') {
-      const info = data.participant;
-      setParticipants((ps) => {
-        const exists = ps.some((p) => p.id === info.id);
-        return exists
-          ? ps.map((p) => (p.id === info.id ? { ...p, ...info } : p))
-          : [...ps, info];
-      });
-    } else if (data.type === 'meeting_status') {
-      setMeeting((m) => ({ ...m, status: data.status }));
+    const data = JSON.parse(e.data) as MeetingEvent;
+    switch (data.type) {
+      case 'message':
+        setMessages((ms) =>
+          ms.some((m) => m.id === data.message.id) ? ms : [...ms, data.message],
+        );
+        break;
+      case 'agent_status':
+        setStates((s) => ({
+          ...s,
+          [data.participantId]: { status: data.status, detail: data.detail },
+        }));
+        break;
+      case 'participant': {
+        const info = data.participant;
+        setParticipants((ps) => {
+          const exists = ps.some((p) => p.id === info.id);
+          return exists
+            ? ps.map((p) => (p.id === info.id ? { ...p, ...info } : p))
+            : [...ps, info];
+        });
+        break;
+      }
+      case 'meeting_status':
+        setMeeting((m) => ({ ...m, status: data.status }));
+        break;
     }
   }, []);
 
@@ -59,14 +66,16 @@ export default function Room({ initial }: { initial: RoomData }) {
     if (res.ok && (action === 'start' || action === 'resume')) {
       setMeeting((m) => ({ ...m, status: 'active' }));
     }
+    if (res.ok && action === 'end') setMeeting((m) => ({ ...m, status: 'ended' }));
   };
 
   const toggleMute = async (participantId: string, muted: boolean) => {
-    await fetch(`/api/meetings/${meeting.id}/participants/${participantId}`, {
+    const res = await fetch(`/api/meetings/${meeting.id}/participants/${participantId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ muted }),
     });
+    if (!res.ok) return;
     setParticipants((ps) =>
       ps.map((p) => (p.id === participantId ? { ...p, muted } : p)),
     );

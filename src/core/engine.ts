@@ -72,9 +72,11 @@ export class MeetingEngine {
   }
 
   participantInfo(p: ParticipantRow): ParticipantInfo {
+    const t = this.db.select().from(agents).where(eq(agents.id, p.templateId)).get();
     return {
       id: p.id, templateId: p.templateId, displayName: p.displayName,
       goal: p.goal, muted: !!p.muted, speakOrder: p.speakOrder,
+      capability: t?.capability ?? '', avatar: t?.avatar ?? '🤖',
     };
   }
 

@@ -8,14 +8,14 @@ describe('events', () => {
     emitMeetingEvent({
       type: 'participant',
       meetingId: 'm1',
-      participant: { id: 'p1', templateId: 'dev', displayName: '张工', goal: 'g', muted: false, speakOrder: 0 },
+      participant: { id: 'p1', templateId: 'dev', displayName: '张工', goal: 'g', muted: false, speakOrder: 0, capability: '研发', avatar: '🧑‍💻' },
     });
     expect(fn).toHaveBeenCalledTimes(1);
     off();
     emitMeetingEvent({
       type: 'participant',
       meetingId: 'm1',
-      participant: { id: 'p1', templateId: 'dev', displayName: '张工', goal: 'g', muted: true, speakOrder: 0 },
+      participant: { id: 'p1', templateId: 'dev', displayName: '张工', goal: 'g', muted: true, speakOrder: 0, capability: '研发', avatar: '🧑‍💻' },
     });
     expect(fn).toHaveBeenCalledTimes(1);
   });

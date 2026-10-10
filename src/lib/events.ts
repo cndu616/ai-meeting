@@ -12,6 +12,9 @@ export interface ParticipantInfo {
   goal: string;
   muted: boolean;
   speakOrder: number;
+  /** 展示字段随事件下发，保证 UI 增量渲染自足 */
+  capability: string;
+  avatar: string;
 }
 
 export type MeetingEvent =

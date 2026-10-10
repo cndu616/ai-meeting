@@ -9,10 +9,8 @@ export interface TemplateInfo {
   avatar: string;
 }
 
-export interface ParticipantView extends ParticipantInfo {
-  capability: string;
-  avatar: string;
-}
+/** 语义别名：展示字段已由 ParticipantInfo 自足，供 UI 组件 props 引用 */
+export interface ParticipantView extends ParticipantInfo {}
 
 export interface RoomData {
   meeting: MeetingRow;

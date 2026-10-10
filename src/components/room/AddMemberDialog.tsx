@@ -57,7 +57,8 @@ export default function AddMemberDialog({
   const input = 'w-full rounded border px-3 py-2 text-sm';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      onClick={busy ? undefined : onClose}>
       <div className="w-96 rounded-lg bg-white p-5 shadow-lg" onClick={(e) => e.stopPropagation()}>
         <h3 className="mb-3 font-semibold">添加成员</h3>
 
@@ -81,7 +82,8 @@ export default function AddMemberDialog({
         {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
 
         <div className="mt-4 flex justify-end gap-2">
-          <button onClick={onClose} className="rounded border px-4 py-1.5 text-sm">取消</button>
+          <button onClick={onClose} disabled={busy}
+            className="rounded border px-4 py-1.5 text-sm disabled:opacity-50">取消</button>
           <button onClick={submit} disabled={busy}
             className="rounded bg-blue-600 px-4 py-1.5 text-sm text-white disabled:opacity-50">
             {busy ? '添加中…' : '加入会议'}
