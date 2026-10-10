@@ -10,6 +10,6 @@ describe('events', () => {
     unsub();
     emitMeetingEvent({ type: 'meeting_status', meetingId: 'm1', status: 'paused' });
     expect(got.length).toBe(1);
-    expect(got[0].status).toBe('active');
+    expect(got[0]).toMatchObject({ type: 'meeting_status', status: 'active' });
   });
 });

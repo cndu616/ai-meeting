@@ -21,8 +21,8 @@ function setup(maxRounds = 4) {
     ],
   };
   let n = 0;
-  const runner = vi.fn(async () => ({
-    speech: `第${++n}条发言`, sessionId: `s-${n}`, toolActivities: [],
+  const runner = vi.fn(async (_input: { resumeSessionId?: string }) => ({
+    speech: `第${++n}条发言`, sessionId: `s-${n}`, toolActivities: [] as { tool: string; detail: string }[],
   }));
   const engine = new MeetingEngine(db, runner as never);
   const m = engine.createMeeting(input);
