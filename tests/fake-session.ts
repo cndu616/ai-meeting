@@ -1,4 +1,4 @@
-// tests/fake-session.ts —— dispatch/dm/control/api 四个测试文件共用
+// tests/fake-session.ts —— dispatch/dm/control/api/crash 五个测试文件共用
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -22,6 +22,8 @@ export class FakeSession {
 export function setupEngine() {
   const db = createTestDb();
   importAgentsToDb(db, loadAgentFiles());
+  // 按 create 调用顺序累积：start 按 speakOrder 创建；
+  // 崩溃重建/离线私信的一次性会话会追加到尾部
   const sessions: FakeSession[] = [];
   const engine = new MeetingEngine(db, {
     create: (opts: SessionCreateOptions) => {

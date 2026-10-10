@@ -1,7 +1,7 @@
 // tests/engine-dispatch.test.ts
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { setupEngine } from './fake-session';
-import { messages, participants } from '@/db/schema';
+import { subscribeMeeting } from '@/lib/events';
 
 describe('分发矩阵', () => {
   it('start：为每个成员建会话并推送开场指令（含开场系统消息增量）', () => {
@@ -16,7 +16,7 @@ describe('分发矩阵', () => {
   });
 
   it('用户消息：广播给所有在线成员（各自水位线推进）', () => {
-    const { db, engine, m, sessions } = setupEngine();
+    const { engine, m, sessions } = setupEngine();
     engine.start(m.id);
     sessions.forEach((s) => (s.pushes = []));
     engine.sendUserMessage(m.id, '大家怎么看？');
@@ -24,9 +24,9 @@ describe('分发矩阵', () => {
       expect(s.pushes.length).toBe(1);
       expect(s.pushes[0].text).toBe('[chatroom 用户] 大家怎么看？');
     }
-    const ps = db.select().from(participants).all();
+    const ps = engine.getParticipants(m.id);
     // 两个成员的水位线都推进到了最新消息 id
-    const maxId = db.select().from(messages).all()
+    const maxId = engine.getMessages(m.id)
       .reduce((a, b) => (b.id > a ? b.id : a), 0);
     expect(ps.every((p) => p.lastInjectedMsgId === maxId)).toBe(true);
   });
@@ -67,10 +67,26 @@ describe('分发矩阵', () => {
     expect(sessions[0].pushes[0].text).not.toContain('禁言');
   });
 
-  it('工具活动：仅状态事件，不进聊天室', () => {
+  it('工具活动：仅状态事件，不进聊天室', async () => {
     const { engine, m, sessions } = setupEngine();
     engine.start(m.id);
+    const p0 = engine.getParticipants(m.id)[0];
+
+    // 正向断言：onTool 发出 agent_status 状态事件
+    const events: unknown[] = [];
+    const unsubscribe = subscribeMeeting(m.id, (e) => events.push(e));
     sessions[0].opts.callbacks.onTool('Read', '/a.ts');
+    await vi.waitFor(() => {
+      if (!events.some(
+        (e) => e.type === 'agent_status'
+          && e.participantId === p0.id
+          && e.status === 'tool'
+          && (e.detail as string).includes('Read /a.ts'),
+      )) throw new Error('未收到 agent_status(tool) 事件');
+    });
+    unsubscribe();
+
+    // 反向断言：不落聊天室消息库
     const msgs = engine.getMessages(m.id);
     expect(msgs.every((x) => !x.content.includes('/a.ts'))).toBe(true);
   });
