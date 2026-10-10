@@ -166,7 +166,12 @@ export class AgentSession {
   private handleEnd(): void {
     if (this.closed) return;
     if (this.restarted) {
-      this.opts.callbacks.onDead();
+      try {
+        this.opts.callbacks.onDead();
+      } catch (err) {
+        // 回调抛错只记录、不逃逸（与 onRestart 同款防护，避免 unhandled rejection）
+        console.error('[AgentSession] onDead 回调执行异常', err);
+      }
       return;
     }
     this.restarted = true;

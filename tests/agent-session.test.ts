@@ -121,6 +121,19 @@ describe('AgentSession', () => {
     await s.close();
   });
 
+  it('新流收到 init 复位容错：重建成功后再 end 应再次重建而非 onDead', async () => {
+    const h = makeHarness();
+    const s = makeSession(h.factory, h.cbs);
+    h.streams[0].end(); // 第一次：崩溃重建
+    await vi.waitFor(() => expect(h.streams.length).toBe(2));
+    h.streams[1].emit(initMsg); // 新流成功建立 → restarted 复位为 false
+    await vi.waitFor(() => expect(h.cbs.onSessionId).toHaveBeenCalledWith('s-1'));
+    h.streams[1].end(); // 第二次：容错已复位 → 应再次重建而非放弃
+    await vi.waitFor(() => expect(h.streams.length).toBe(3));
+    expect(h.cbs.onDead).not.toHaveBeenCalled();
+    await s.close();
+  });
+
   it('重建后的 query 携带最新 sessionId（resume）', async () => {
     const h = makeHarness();
     const resumeIds: (string | undefined)[] = [];
