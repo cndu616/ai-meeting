@@ -2893,6 +2893,14 @@ Task 3 的计划代码块经代码审查发现三处缺陷，已在 commit `0a41
 
 对 engine 的影响：`AgentSessionCallbacks` 接口签名不变，Task 4 的 engine 代码无需调整；onRestart 触发时新队列已就绪，catchUp 可安全 push。
 
+**Task 4 勘误**（commit `ebd3cf9` 修复，计划 engine.ts 参考代码中的两处缺陷，后续任务以实际代码为准）：
+
+4. **onDead 必须摘除会话**：`createSessionFor` 的 onDead 里先 `this.sessionsOf(meetingId).delete(p.id)` 再置 offline——否则死会话残留在 Map：广播继续推死队列且推进水位线（消息永久丢失）、sendDm 走常驻分支丢私信、start() 的 has 检查挡住恢复重建。已由 `tests/engine-crash.test.ts` 锁定。
+5. **runDmOffline 的 onRestart 必须重发私信**（`session.push(buildDmPrompt(content), 'dm')`，利用勘误 1 的「新队列已就绪」契约）且 gate 需 120s 超时兜底（`DM_OFFLINE_TIMEOUT_MS` + settled/finish 防双落定）——否则暂停态私信推送后崩溃重建，gate 永挂（API Promise 不落定）。计划代码中 `onRestart: () => {}` 为缺陷。
+6. **insertMessage 用 `.returning().all()` 取 [0]** 取代全表重查取末位（正确性不再依赖 SQLite 返回顺序）。
+
+另：Task 6 派发时补一条 fake-timer 超时用例（120s 超时落 system 消息 → close → idle）。
+
 ## 风险与回退
 
 - **SDK streaming 行为不符预期**（如 push 不触发 turn、result 不逐条对应）：Task 3 的 AgentSession 测试先行暴露；E2E（Task 10）最终验证真实行为。~~若 push:result 一一对应假设被证伪，回退方案是「文本自标记」~~——已由 uuid 绑定机制解决（见上方实现勘误第 3 条），真实 CLI 的 batch 合并行为仍需 E2E 观察确认。
