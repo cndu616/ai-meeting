@@ -2870,6 +2870,8 @@ npm run dev
 7. 暂停 → 继续：会话重建、补发暂停期间消息。
 8. 结束：按钮变灰、聊天室出现结束系统消息；刷新页面历史完整回放。
 9. 重启 dev server（active 会议存在时）：引擎自动恢复会话。
+10. DM 通道正确性（uuid 绑定的真实行为）：快速连续给同一成员发聊天室消息+私信（构造 SDK batch 合并）→ 私信回复绝不进聊天室；观察某成员长工具循环触发 `error_max_turns` 后，其后续回复通道不错位。
+11. 崩溃鲁棒性（可选）：会议进行中 kill 某成员的 CLI 子进程 → 自动重建（onRestart→catchUp 补发增量）；再 kill 一次 → 掉线标记、会议不受影响。
 
 验证中发现问题：小问题当场修并补测试；架构级问题停下来与用户讨论。
 
@@ -2881,8 +2883,18 @@ git add -A && git commit -m "test: 全量验证通过；E2E 手测自由响应�
 
 ---
 
+## 实现勘误（Task 3 代码审查后修订）
+
+Task 3 的计划代码块经代码审查发现三处缺陷，已在 commit `0a41dc8` 修复——**后续任务以 `src/core/agent-session.ts` 实际代码为准，勿照抄本计划 Task 3 Step 3 的代码块**：
+
+1. **handleEnd 顺序修正**：先 `start()`（换新队列）再回调 `onRestart()`——原顺序下 engine 的 catchUp 补发会写入已死的旧队列（消息永久丢失且水位线已推进）。
+2. **result 分支放宽**：`msg.type === 'result'` 任意 subtype 都出队销账；非 success 文本按空串 `onResult('', kind)`——error result（error_max_turns 等）同样是 turn 完成信号，只在 success 出队会让 DM 标记错位。
+3. **DM 通道改用 uuid 绑定**（取代 pendingKinds 顺序数组）：push 时生成 uuid 记入 `Map<uuid, PushKind>`（SDKUserMessage 带 uuid 字段），result 按 `user_message_uuids`（prompt batch 合并时含全部成员 uuid）逐个销账，**含任一 dm 则按 dm 归并**（宁漏播不泄漏）；单数 `user_message_uuid` 次之；均缺失时按插入序回退（旧 producer 兼容）。SDK 文档（sdk.d.ts）确认 host 传入的 uuid 会被回显。另：consume 收到 init 时复位 `restarted`（连续失败才放弃）、catch 不再静默、onRestart/onDead 回调包 try/catch 防逃逸、close 为「请求关闭」语义（不等待当前 turn）。
+
+对 engine 的影响：`AgentSessionCallbacks` 接口签名不变，Task 4 的 engine 代码无需调整；onRestart 触发时新队列已就绪，catchUp 可安全 push。
+
 ## 风险与回退
 
-- **SDK streaming 行为不符预期**（如 push 不触发 turn、result 不逐条对应）：Task 3 的 AgentSession 测试先行暴露；E2E（Task 10）最终验证真实行为。若 push:result 一一对应假设被证伪，回退方案是在 AgentSession 内改用「文本自标记」（DM 指令要求回复以固定前缀开头）。
+- **SDK streaming 行为不符预期**（如 push 不触发 turn、result 不逐条对应）：Task 3 的 AgentSession 测试先行暴露；E2E（Task 10）最终验证真实行为。~~若 push:result 一一对应假设被证伪，回退方案是「文本自标记」~~——已由 uuid 绑定机制解决（见上方实现勘误第 3 条），真实 CLI 的 batch 合并行为仍需 E2E 观察确认。
 - **同一消息重复补发**（崩溃瞬间）：可接受——LLM 上下文重复一条消息无害。
 - **回退**：本计划是纯重构，git revert 各任务提交即可回到 v1。
