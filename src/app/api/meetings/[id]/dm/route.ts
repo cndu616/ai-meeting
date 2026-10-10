@@ -6,8 +6,8 @@ export async function POST(
 ) {
   const { id } = await ctx.params;
   try {
-    const { agentId, content } = await req.json();
-    await getEngine().sendDm(id, String(agentId), String(content));
+    const { participantId, content } = await req.json();
+    await getEngine().sendDm(id, String(participantId), String(content));
     return Response.json({ ok: true });
   } catch (e) {
     return Response.json({ error: (e as Error).message }, { status: 400 });
