@@ -6,7 +6,6 @@ import type { DB } from '@/db/client';
 
 export const agentFileSchema = z.object({
   id: z.string().regex(/^[a-z0-9-]+$/),
-  name: z.string().min(1),
   capability: z.string().min(1),
   description: z.string().min(1),
   persona: z.string().min(1),
