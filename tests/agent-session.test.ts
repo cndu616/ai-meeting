@@ -28,6 +28,8 @@ class ControlledStream implements AsyncIterable<SDKMessage> {
 
 function makeHarness(overrides?: Partial<AgentSessionCallbacks>) {
   const pushed: SDKUserMessage[] = [];
+  /** 每个 query 独立记录各自的 prompt 消费（按流创建顺序） */
+  const pushedByStream: SDKUserMessage[][] = [];
   const streams: ControlledStream[] = [];
   const cbs = {
     onSessionId: vi.fn(),
@@ -40,12 +42,17 @@ function makeHarness(overrides?: Partial<AgentSessionCallbacks>) {
   const factory: QueryFactory = ({ prompt }) => {
     const stream = new ControlledStream();
     streams.push(stream);
+    const mine: SDKUserMessage[] = [];
+    pushedByStream.push(mine);
     void (async () => {
-      for await (const m of prompt) pushed.push(m);
+      for await (const m of prompt) {
+        pushed.push(m);
+        mine.push(m);
+      }
     })();
     return stream;
   };
-  return { pushed, streams, cbs, factory };
+  return { pushed, pushedByStream, streams, cbs, factory };
 }
 
 const initMsg = { type: 'system', subtype: 'init', session_id: 's-1' } as SDKMessage;
@@ -127,6 +134,108 @@ describe('AgentSession', () => {
     h.streams[0].end(); // 触发重建
     await vi.waitFor(() => expect(h.streams.length).toBe(2));
     expect(resumeIds[1]).toBe('s-1');
+    await s.close();
+  });
+
+  it('onRestart 回调内立即 push 落进新流（重建先就绪再回调）', async () => {
+    let session!: AgentSession;
+    const h = makeHarness({ onRestart: () => session.push('补发增量', 'chatroom') });
+    session = makeSession(h.factory, h.cbs);
+    session.push('崩溃前的消息');
+    await vi.waitFor(() => expect(h.pushedByStream[0]?.length).toBe(1));
+    expect(h.pushedByStream[0][0].message.content).toBe('崩溃前的消息');
+
+    h.streams[0].end(); // 崩溃 → 重建 → onRestart 内补发
+    await vi.waitFor(() => expect(h.streams.length).toBe(2));
+    await vi.waitFor(() => expect(h.pushedByStream[1]?.length).toBe(1));
+    expect(h.pushedByStream[1][0].message.content).toBe('补发增量');
+    expect(h.pushedByStream[0].length).toBe(1); // 旧流不会收到补发
+    await session.close();
+  });
+
+  it('非 success result 也出队（文本按空串）且不导致后续错位', async () => {
+    const h = makeHarness();
+    const s = makeSession(h.factory, h.cbs);
+    s.push('公开消息', 'chatroom');
+    s.push('私信内容', 'dm');
+    h.streams[0].emit({
+      type: 'result',
+      subtype: 'error_max_turns',
+      session_id: 's-e',
+    } as unknown as SDKMessage);
+    await vi.waitFor(() => expect(h.cbs.onResult).toHaveBeenCalledWith('', 'chatroom'));
+
+    h.streams[0].emit(okResult('恢复后的公开回复'));
+    await vi.waitFor(() => expect(h.cbs.onResult).toHaveBeenCalledWith('恢复后的公开回复', 'dm'));
+    await s.close();
+  });
+
+  it('崩溃重建后残留绑定被清空：旧 dm uuid 不会把公开回复误判为 dm', async () => {
+    const h = makeHarness();
+    const s = makeSession(h.factory, h.cbs);
+    s.push('未及回复的私信', 'dm');
+    await vi.waitFor(() => expect(h.pushedByStream[0]?.length).toBe(1));
+    const dmUuid = h.pushedByStream[0][0].uuid!;
+
+    h.streams[0].end(); // 崩溃重建（绑定应被清空）
+    await vi.waitFor(() => expect(h.streams.length).toBe(2));
+    h.streams[1].emit({
+      type: 'result',
+      subtype: 'success',
+      result: '重建后的公开回复',
+      user_message_uuid: dmUuid,
+      user_message_uuids: [dmUuid],
+      session_id: 's-4',
+    } as unknown as SDKMessage);
+    await vi.waitFor(() =>
+      expect(h.cbs.onResult).toHaveBeenCalledWith('重建后的公开回复', 'chatroom'),
+    );
+    await s.close();
+  });
+
+  it('close 后流 end 不触发 onRestart/onDead', async () => {
+    const h = makeHarness();
+    const s = makeSession(h.factory, h.cbs);
+    await s.close();
+    h.streams[0].end();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(h.cbs.onRestart).not.toHaveBeenCalled();
+    expect(h.cbs.onDead).not.toHaveBeenCalled();
+  });
+
+  it('合并 turn 的 user_message_uuids 归并 kind：含 dm 则 dm；销账后无残留错位', async () => {
+    const h = makeHarness();
+    const s = makeSession(h.factory, h.cbs);
+    s.push('聊天室消息', 'chatroom');
+    s.push('私信内容', 'dm');
+    await vi.waitFor(() => expect(h.pushedByStream[0]?.length).toBe(2));
+    const [u1, u2] = h.pushedByStream[0].map((m) => m.uuid!);
+
+    // N push → 1 result：列表同时含两个 uuid，含 dm 则归并为 dm
+    h.streams[0].emit({
+      type: 'result',
+      subtype: 'success',
+      result: '合并回复',
+      user_message_uuid: u2,
+      user_message_uuids: [u1, u2],
+      session_id: 's-3',
+    } as unknown as SDKMessage);
+    await vi.waitFor(() => expect(h.cbs.onResult).toHaveBeenCalledTimes(1));
+    expect(h.cbs.onResult).toHaveBeenCalledWith('合并回复', 'dm');
+
+    // Map 已销账干净：残留 dm uuid 再被回显也不该把新的公开回复误判为 dm
+    s.push('后续聊天室消息', 'chatroom');
+    await vi.waitFor(() => expect(h.pushedByStream[0]?.length).toBe(3));
+    h.streams[0].emit({
+      type: 'result',
+      subtype: 'success',
+      result: '后续回复',
+      user_message_uuid: u2,
+      user_message_uuids: [u2],
+      session_id: 's-3',
+    } as unknown as SDKMessage);
+    await vi.waitFor(() => expect(h.cbs.onResult).toHaveBeenCalledTimes(2));
+    expect(h.cbs.onResult).toHaveBeenLastCalledWith('后续回复', 'chatroom');
     await s.close();
   });
 });
