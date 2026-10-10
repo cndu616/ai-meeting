@@ -8,6 +8,7 @@ import {
 import type { DB } from '@/db/client';
 import { emitMeetingEvent, type MeetingStatus } from '@/lib/events';
 import { runAgentTurn } from './agent-runner';
+import { collectChatroomIncrement, buildSpeechPrompt, buildDmPrompt, isSkip } from './injector';
 
 export interface CreateMeetingInput {
   title: string;
@@ -182,6 +183,151 @@ ${roster}
 - 发言像真实会议发言一样简洁聚焦（通常几十到两三百字），不要输出长篇报告或标题堆砌
 - 用户可能私信你（消息带 [user 私信→你] 前缀），私信与你的私聊回复仅双方可见，不会进入聊天室；私信中的指示会影响你的立场，这是允许的`;
   }
+
+  // ---------- 运行控制 ----------
+
+  private loops = new Map<string, { pause: boolean; promise: Promise<void> }>();
+
+  isRunning(meetingId: string): boolean {
+    return this.loops.has(meetingId);
+  }
+
+  /** 启动（或重启）轮次循环，返回循环结束的 promise */
+  start(meetingId: string): Promise<void> {
+    if (this.getMeeting(meetingId).status === 'ended') {
+      throw new Error('会议已结束，无法开始');
+    }
+    this.setStatus(meetingId, 'active');
+    if (this.loops.has(meetingId)) return this.loops.get(meetingId)!.promise;
+    // 注意：runLoop 与 loops 必须持有同一个 ctl 引用，pause() 才能生效
+    const ctl: { pause: boolean; promise: Promise<void> } = {
+      pause: false,
+      promise: Promise.resolve(),
+    };
+    ctl.promise = this.runLoop(meetingId, ctl)
+      .catch((e) => console.error(`[engine] 会议 ${meetingId} 循环异常:`, e))
+      .finally(() => this.loops.delete(meetingId));
+    this.loops.set(meetingId, ctl);
+    return ctl.promise;
+  }
+
+  private setStatus(meetingId: string, status: MeetingStatus): void {
+    this.db.update(meetings)
+      .set({ status, ...(status === 'ended' ? { endedAt: Date.now() } : {}) })
+      .where(eq(meetings.id, meetingId)).run();
+    emitMeetingEvent({ type: 'meeting_status', meetingId, status });
+  }
+
+  private shouldStop(meetingId: string, ctl: { pause: boolean }): boolean {
+    return ctl.pause || this.getMeeting(meetingId).status !== 'active';
+  }
+
+  private async runLoop(meetingId: string, ctl: { pause: boolean }): Promise<void> {
+    while (!this.shouldStop(meetingId, ctl)) {
+      const m = this.getMeeting(meetingId);
+      if (m.currentRound >= m.maxRounds) {
+        const exhausted = this.insertMessage({
+          meetingId, channel: 'chatroom', kind: 'system',
+          content: `已达到最大轮数（${m.maxRounds}），会议暂停。可追加轮数后继续。`,
+        });
+        this.emitMessage(exhausted);
+        this.setStatus(meetingId, 'paused');
+        return;
+      }
+      const round = m.currentRound + 1;
+      this.db.update(meetings)
+        .set({ currentRound: round }).where(eq(meetings.id, meetingId)).run();
+      emitMeetingEvent({ type: 'round', meetingId, round, phase: 'start' });
+
+      for (const p of this.getParticipants(meetingId)) {
+        if (this.shouldStop(meetingId, ctl)) return;
+        await this.processPendingDms(meetingId, p);
+        if (this.shouldStop(meetingId, ctl)) return;
+        await this.runSpeechTurn(meetingId, p, round);
+      }
+      emitMeetingEvent({ type: 'round', meetingId, round, phase: 'end' });
+    }
+  }
+
+  /** 单个 agent 的会议发言回合 */
+  private async runSpeechTurn(
+    meetingId: string,
+    p: ParticipantRow,
+    round: number,
+  ): Promise<void> {
+    const m = this.getMeeting(meetingId);
+    const agent = this.agentMap().get(p.agentId)!;
+    this.setAgentStatus(meetingId, p.agentId, 'thinking');
+
+    const increment = collectChatroomIncrement(this.db, meetingId, p.id);
+    const senderMap = new Map(
+      [...this.agentMap().entries()].map(([id, a]) =>
+        [id, { name: a.name, capability: a.capability }] as const,
+      ),
+    );
+    const prompt = buildSpeechPrompt({ increment, agentsById: senderMap, round });
+    const systemPrompt = this.buildSystemPrompt(meetingId, p.agentId);
+
+    let result: Awaited<ReturnType<Runner>> | undefined;
+    for (let attempt = 0; attempt < 2 && !result; attempt++) {
+      try {
+        const r = await this.runner({
+          systemPrompt, workspacePath: m.workspacePath, prompt,
+          resumeSessionId: p.sdkSessionId ?? undefined,
+        });
+        if (r.speech) result = r;
+        else break; // 无文本视为失败，不再重试空结果
+      } catch {
+        result = undefined; // 重试一次
+      }
+    }
+
+    if (!result) {
+      this.emitMessage(this.insertMessage({
+        meetingId, channel: 'chatroom', kind: 'system',
+        content: `${agent.name} 本轮发言失败，已跳过。`,
+      }));
+      this.setAgentStatus(meetingId, p.agentId, 'idle');
+      return;
+    }
+
+    // 更新会话 id（召回依据）
+    this.db.update(participants)
+      .set({ sdkSessionId: result.sessionId })
+      .where(eq(participants.id, p.id)).run();
+
+    // 工具活动仅作为状态事件（不进聊天室）
+    for (const t of result.toolActivities) {
+      this.setAgentStatus(meetingId, p.agentId, 'tool', `${t.tool} ${t.detail}`.trim());
+    }
+
+    const watermarkBase = increment.length
+      ? increment[increment.length - 1].id
+      : p.lastInjectedMsgId;
+    if (isSkip(result.speech)) {
+      this.emitMessage(this.insertMessage({
+        meetingId, channel: 'chatroom', kind: 'system', round,
+        content: `${agent.name} 跳过本轮发言。`,
+      }));
+      this.db.update(participants)
+        .set({ lastInjectedMsgId: watermarkBase })
+        .where(eq(participants.id, p.id)).run();
+    } else {
+      this.setAgentStatus(meetingId, p.agentId, 'speaking');
+      const msg = this.insertMessage({
+        meetingId, channel: 'chatroom', kind: 'speech',
+        agentId: p.agentId, content: result.speech, round,
+      });
+      this.emitMessage(msg);
+      this.db.update(participants)
+        .set({ lastInjectedMsgId: Math.max(watermarkBase, msg.id) })
+        .where(eq(participants.id, p.id)).run();
+    }
+    this.setAgentStatus(meetingId, p.agentId, 'idle');
+  }
+
+  /** 轮到某 agent 发言前，先处理其排队私信（Task 9 实现） */
+  private async processPendingDms(_meetingId: string, _p: ParticipantRow): Promise<void> {}
 }
 
 export type { MeetingStatus };
