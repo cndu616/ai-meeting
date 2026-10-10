@@ -18,12 +18,24 @@ export type AgentFile = z.infer<typeof agentFileSchema>;
 export function loadAgentFiles(
   dir: string = path.join(process.cwd(), 'agents'),
 ): AgentFile[] {
-  return fs
+  const files = fs
     .readdirSync(dir)
     .filter((f) => f.endsWith('.json'))
-    .map((f) =>
-      agentFileSchema.parse(JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8'))),
-    );
+    .map((f) => ({
+      file: f,
+      agent: agentFileSchema.parse(
+        JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8')),
+      ),
+    }));
+  const seen = new Map<string, string>();
+  for (const { file, agent } of files) {
+    const prev = seen.get(agent.id);
+    if (prev) {
+      throw new Error(`agent id "${agent.id}" 重复：${prev} 与 ${file}，请修改其中一个的 id 字段`);
+    }
+    seen.set(agent.id, file);
+  }
+  return files.map((f) => f.agent);
 }
 
 export function importAgentsToDb(db: DB, files: AgentFile[]): void {

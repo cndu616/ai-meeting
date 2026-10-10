@@ -63,7 +63,8 @@ describe('createMeeting', () => {
     const sp = (engine as unknown as {
       buildSystemPrompt: (meetingId: string, agentId: string) => string;
     }).buildSystemPrompt(m.id, 'dev');
-    expect(sp).toContain('老王');
+    const dev = loadAgentFiles().find((a) => a.id === 'dev')!;
+    expect(sp).toContain(dev.persona.slice(0, 10)); // 动态引用，agent 改名不改测试
     expect(sp).toContain('激进派：主张全面重写');
     expect(sp).toContain('[SKIP]');
   });
