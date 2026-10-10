@@ -10,7 +10,7 @@ export interface TemplateInfo {
 }
 
 /** 语义别名：展示字段已由 ParticipantInfo 自足，供 UI 组件 props 引用 */
-export interface ParticipantView extends ParticipantInfo {}
+export type ParticipantView = ParticipantInfo;
 
 export interface RoomData {
   meeting: MeetingRow;

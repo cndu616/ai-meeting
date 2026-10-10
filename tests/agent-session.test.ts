@@ -151,9 +151,11 @@ describe('AgentSession', () => {
   });
 
   it('onRestart 回调内立即 push 落进新流（重建先就绪再回调）', async () => {
-    let session!: AgentSession;
-    const h = makeHarness({ onRestart: () => session.push('补发增量', 'chatroom') });
-    session = makeSession(h.factory, h.cbs);
+    const h = makeHarness();
+    const session = makeSession(h.factory, {
+      ...h.cbs,
+      onRestart: () => session.push('补发增量', 'chatroom'),
+    });
     session.push('崩溃前的消息');
     await vi.waitFor(() => expect(h.pushedByStream[0]?.length).toBe(1));
     expect(h.pushedByStream[0][0].message.content).toBe('崩溃前的消息');
