@@ -26,6 +26,9 @@ export interface CreateMeetingInput {
 const MUTE_SUFFIX =
   '\n（你现在被主持人禁言，请勿发言，直接回复 [SKIP]，并记住该消息作为上下文。）';
 
+/** 暂停态私信回合的兜底超时：防 gate 因未预见路径（如崩溃后无 result）永久挂起 */
+const DM_OFFLINE_TIMEOUT_MS = 120_000;
+
 export class MeetingEngine {
   /** meetingId -> participantId -> session */
   private sessions = new Map<string, Map<string, AgentSessionLike>>();
@@ -83,17 +86,15 @@ export class MeetingEngine {
     kind: 'speech' | 'user' | 'system' | 'dm_user' | 'dm_agent';
     content: string;
   }): MessageRow {
-    this.db.insert(messages).values({
+    const [msg] = this.db.insert(messages).values({
       meetingId: row.meetingId,
       channel: row.channel,
       participantId: row.participantId ?? null,
       kind: row.kind,
       content: row.content,
       createdAt: Date.now(),
-    }).run();
-    const all = this.db.select().from(messages)
-      .where(eq(messages.meetingId, row.meetingId)).all();
-    return all[all.length - 1]; // 自增 id，最后一条即刚插入的
+    }).returning().all();
+    return msg;
   }
 
   emitMessage(msg: MessageRow): void {
@@ -287,7 +288,12 @@ ${this.roster(meetingId)}
           this.setAgentStatus(meetingId, p.id, 'tool', `${tool} ${detail}`.trim()),
         onResult: (text, kind) => this.handleAgentResult(meetingId, p.id, text, kind),
         onRestart: () => this.catchUp(meetingId, p.id),
-        onDead: () => this.setAgentStatus(meetingId, p.id, 'offline'),
+        onDead: () => {
+          // 掉线即摘除会话：broadcast 自动跳过（水位线不推进，消息留待恢复时 catchUp 补发），
+          // sendDm 自动落一次性回合分支，start() 可重建
+          this.sessionsOf(meetingId).delete(p.id);
+          this.setAgentStatus(meetingId, p.id, 'offline');
+        },
       },
     });
     session.start();
@@ -429,6 +435,12 @@ ${this.roster(meetingId)}
     const m = this.getMeeting(meetingId);
     let done!: () => void;
     const gate = new Promise<void>((r) => (done = r));
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      done();
+    };
     this.setAgentStatus(meetingId, p.id, 'thinking', '私聊中');
     const session = this.sessionFactory.create({
       systemPrompt: this.buildSystemPrompt(meetingId, p.id),
@@ -444,21 +456,32 @@ ${this.roster(meetingId)}
           this.setAgentStatus(meetingId, p.id, 'tool', `${tool} ${detail}`.trim()),
         onResult: (text) => {
           this.handleAgentResult(meetingId, p.id, text, 'dm');
-          done();
+          finish();
         },
-        onRestart: () => {},
+        onRestart: () => {
+          // 崩溃重建后原私信可能未进转录：重发一次（新队列已就绪，push 安全）
+          session.push(buildDmPrompt(content), 'dm');
+        },
         onDead: () => {
           this.emitMessage(this.insertMessage({
             meetingId, channel: 'dm', kind: 'system', participantId: p.id,
             content: `${p.displayName} 私信回复失败。`,
           }));
-          done();
+          finish();
         },
       },
     });
     session.start();
     session.push(buildDmPrompt(content), 'dm');
-    await gate;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      this.emitMessage(this.insertMessage({
+        meetingId, channel: 'dm', kind: 'system', participantId: p.id,
+        content: `${p.displayName} 私信回复超时。`,
+      }));
+      finish();
+    }, DM_OFFLINE_TIMEOUT_MS);
+    await gate.then(() => clearTimeout(timeout));
     await session.close();
     this.setAgentStatus(meetingId, p.id, 'idle');
   }
