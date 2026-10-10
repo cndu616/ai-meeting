@@ -7,6 +7,7 @@ export async function POST(
   const { id } = await ctx.params;
   try {
     const { participantId, content } = await req.json();
+    if (!content?.trim()) return Response.json({ error: '私信内容不能为空' }, { status: 400 });
     await getEngine().sendDm(id, String(participantId), String(content));
     return Response.json({ ok: true });
   } catch (e) {

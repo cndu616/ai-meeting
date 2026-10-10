@@ -12,7 +12,7 @@ export async function POST(
       displayName: String(body.displayName ?? ''),
       goal: String(body.goal ?? ''),
     });
-    return Response.json(p, { status: 201 });
+    return Response.json(getEngine().participantInfo(p), { status: 201 });
   } catch (e) {
     return Response.json({ error: (e as Error).message }, { status: 400 });
   }

@@ -88,6 +88,7 @@ describe('api', () => {
     expect(ok.status).toBe(201);
     const row = await ok.json();
     expect(row.displayName).toBe('王架构');
+    expect(row.muted).toBe(false);
 
     const bad = await addParticipant(
       new NextRequest(`http://x/api/meetings/${created.id}/participants`, {
@@ -99,7 +100,7 @@ describe('api', () => {
     expect(bad.status).toBe(400);
   });
 
-  it('PATCH 禁言：返回 muted=1 的 participant', async () => {
+  it('PATCH 禁言：返回 muted=true 的 participantInfo 投影', async () => {
     const created = await (await createMeeting(new NextRequest('http://x/api/meetings', {
       method: 'POST', body: JSON.stringify(body()),
     }))).json();
@@ -112,7 +113,7 @@ describe('api', () => {
       { params: Promise.resolve({ id: created.id, participantId: ps[0].id }) },
     );
     expect(res.status).toBe(200);
-    expect((await res.json()).muted).toBe(1);
+    expect((await res.json()).muted).toBe(true);
   });
 
   it('DM（participantId 语义）返回 200（active 会话路径，push 即返回不等待）', async () => {
@@ -139,6 +140,7 @@ describe('api', () => {
         { params: Promise.resolve({ id: 'm1', action: act }) },
       );
       expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/未知操作/);
     }
   });
 });

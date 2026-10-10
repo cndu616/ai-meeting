@@ -7,8 +7,9 @@ export async function PATCH(
   const { id, participantId } = await ctx.params;
   try {
     const { muted } = await req.json();
-    const p = getEngine().setMuted(id, participantId, !!muted);
-    return Response.json(p);
+    if (typeof muted !== 'boolean') return Response.json({ error: 'muted 须为 boolean' }, { status: 400 });
+    const p = getEngine().setMuted(id, participantId, muted);
+    return Response.json(getEngine().participantInfo(p));
   } catch (e) {
     return Response.json({ error: (e as Error).message }, { status: 400 });
   }
