@@ -326,8 +326,95 @@ ${roster}
     this.setAgentStatus(meetingId, p.agentId, 'idle');
   }
 
-  /** 轮到某 agent 发言前，先处理其排队私信（Task 9 实现） */
-  private async processPendingDms(_meetingId: string, _p: ParticipantRow): Promise<void> {}
+  /** 轮到某 agent 发言前，先处理其排队私信 */
+  private async processPendingDms(meetingId: string, p: ParticipantRow): Promise<void> {
+    const q = this.pendingDms.get(p.id);
+    if (!q?.length) return;
+    this.pendingDms.set(p.id, []);
+    await this.runDmTurn(meetingId, p, q);
+  }
+
+  private async runDmTurn(
+    meetingId: string,
+    p: ParticipantRow,
+    dmContents: string[],
+  ): Promise<void> {
+    const m = this.getMeeting(meetingId);
+    const agent = this.agentMap().get(p.agentId)!;
+    this.setAgentStatus(meetingId, p.agentId, 'thinking', '私聊中');
+    const prompt = buildDmPrompt(dmContents);
+    const systemPrompt = this.buildSystemPrompt(meetingId, p.agentId);
+    try {
+      const r = await this.runner({
+        systemPrompt, workspacePath: m.workspacePath, prompt,
+        resumeSessionId: p.sdkSessionId ?? undefined,
+      });
+      if (r.sessionId) {
+        this.db.update(participants)
+          .set({ sdkSessionId: r.sessionId })
+          .where(eq(participants.id, p.id)).run();
+      }
+      if (r.speech) {
+        this.emitMessage(this.insertMessage({
+          meetingId, channel: 'dm', kind: 'dm_agent', agentId: p.agentId,
+          content: r.speech,
+        }));
+      } else {
+        this.emitMessage(this.insertMessage({
+          meetingId, channel: 'dm', kind: 'system', agentId: p.agentId,
+          content: `${agent.name} 未能回复私信。`,
+        }));
+      }
+    } catch {
+      this.emitMessage(this.insertMessage({
+        meetingId, channel: 'dm', kind: 'system', agentId: p.agentId,
+        content: `${agent.name} 私信回复失败。`,
+      }));
+    }
+    this.setAgentStatus(meetingId, p.agentId, 'idle');
+  }
+
+  // ---------- 用户消息 ----------
+
+  sendUserMessage(meetingId: string, content: string): MessageRow {
+    if (this.getMeeting(meetingId).status === 'ended') {
+      throw new Error('会议已结束，无法发言');
+    }
+    const msg = this.insertMessage({
+      meetingId, channel: 'chatroom', kind: 'user', content,
+    });
+    this.emitMessage(msg);
+    return msg;
+  }
+
+  // ---------- 私聊 ----------
+
+  private pendingDms = new Map<string, string[]>(); // participantId -> 私信内容
+
+  async sendDm(meetingId: string, agentId: string, content: string): Promise<void> {
+    const m = this.getMeeting(meetingId);
+    if (m.status === 'ended') throw new Error('会议已结束，无法私聊');
+    const p = this.getParticipantByAgent(meetingId, agentId);
+    this.emitMessage(this.insertMessage({
+      meetingId, channel: 'dm', kind: 'dm_user', agentId, content,
+    }));
+    if (m.status === 'active' && this.isRunning(meetingId)) {
+      const q = this.pendingDms.get(p.id) ?? [];
+      q.push(content);
+      this.pendingDms.set(p.id, q);
+    } else {
+      // 暂停中（或循环已死）即时私聊回合
+      await this.runDmTurn(meetingId, p, [content]);
+    }
+  }
+
+  // ---------- 会议控制（end 的最小实现，其余在后续任务） ----------
+
+  end(meetingId: string): void {
+    const loop = this.loops.get(meetingId);
+    if (loop) loop.pause = true;
+    this.setStatus(meetingId, 'ended');
+  }
 }
 
 export type { MeetingStatus };
