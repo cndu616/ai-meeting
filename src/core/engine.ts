@@ -1,7 +1,7 @@
 // src/core/engine.ts
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
-import { and, eq } from 'drizzle-orm';
+import { and, asc, eq } from 'drizzle-orm';
 import {
   agents, meetings, participants, messages,
   type AgentRow, type MeetingRow, type MessageRow, type ParticipantRow,
@@ -55,7 +55,8 @@ export class MeetingEngine {
 
   getMessages(meetingId: string): MessageRow[] {
     return this.db.select().from(messages)
-      .where(eq(messages.meetingId, meetingId)).all();
+      .where(eq(messages.meetingId, meetingId))
+      .orderBy(asc(messages.id)).all();
   }
 
   getParticipant(meetingId: string, participantId: string): ParticipantRow {

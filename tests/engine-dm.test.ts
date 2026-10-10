@@ -1,6 +1,7 @@
 // tests/engine-dm.test.ts
 import { describe, it, expect, vi } from 'vitest';
 import { setupEngine } from './fake-session';
+import { subscribeMeeting } from '@/lib/events';
 
 describe('私聊', () => {
   it('active 会议：DM 立即推入目标会话（kind=dm），其他人不收', async () => {
@@ -34,7 +35,9 @@ describe('私聊', () => {
     engine.setMuted(m.id, ps[0].id, true);
     sessions.forEach((s) => (s.pushes = []));
     await engine.sendDm(m.id, ps[0].id, '还是聊聊');
+    expect(sessions[0].pushes.length).toBe(1);
     expect(sessions[0].pushes[0].kind).toBe('dm');
+    expect(sessions[0].pushes[0].text).toContain('[user 私信→你] 还是聊聊');
     expect(sessions[0].pushes[0].text).not.toContain('禁言');
   });
 
@@ -54,13 +57,25 @@ describe('私聊', () => {
     expect(dmMsgs.map((x) => x.kind)).toEqual(['dm_user', 'dm_agent']);
   });
 
+  it('paused 私信：onDead 落失败 system 消息并放行收尾', async () => {
+    const { engine, m, sessions } = setupEngine();
+    const ps = engine.getParticipants(m.id);
+    const dmPromise = engine.sendDm(m.id, ps[0].id, '在吗');
+    const offline = sessions[0];
+    offline.opts.callbacks.onDead();
+    await dmPromise; // onDead 也必须 finish，否则要等 120s 超时兜底
+    expect(offline.closed).toBe(true);
+    const dmMsgs = engine.getMessages(m.id).filter((x) => x.channel === 'dm');
+    expect(dmMsgs.map((x) => x.kind)).toEqual(['dm_user', 'system']);
+    expect(dmMsgs[1].content).toContain('私信回复失败');
+  });
+
   it('paused 私聊超时：120s 落 system 超时消息、关闭会话、状态回 idle', async () => {
     vi.useFakeTimers();
     try {
       const { engine, m, sessions } = setupEngine();
       const ps = engine.getParticipants(m.id);
       // 订阅状态事件，验证超时收尾后回 idle
-      const { subscribeMeeting } = await import('@/lib/events');
       const statuses: { participantId: string; status: string }[] = [];
       const off = subscribeMeeting(m.id, (e) => {
         if (e.type === 'agent_status') statuses.push({ participantId: e.participantId, status: e.status });
