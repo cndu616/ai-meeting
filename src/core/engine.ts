@@ -408,12 +408,32 @@ ${roster}
     }
   }
 
-  // ---------- 会议控制（end 的最小实现，其余在后续任务） ----------
+  // ---------- 会议控制 ----------
+
+  pause(meetingId: string): void {
+    const loop = this.loops.get(meetingId);
+    if (loop) loop.pause = true;
+    if (this.getMeeting(meetingId).status === 'active') this.setStatus(meetingId, 'paused');
+  }
+
+  resume(meetingId: string): Promise<void> {
+    const m = this.getMeeting(meetingId);
+    if (m.status === 'ended') throw new Error('会议已结束，无法继续');
+    return this.start(meetingId); // start 会置 active 并重启循环（sdkSessionId 已在参与者行里）
+  }
 
   end(meetingId: string): void {
     const loop = this.loops.get(meetingId);
     if (loop) loop.pause = true;
     this.setStatus(meetingId, 'ended');
+  }
+
+  extendRounds(meetingId: string, rounds: number): void {
+    const m = this.getMeeting(meetingId);
+    if (m.status === 'ended') throw new Error('会议已结束');
+    this.db.update(meetings)
+      .set({ maxRounds: m.maxRounds + rounds })
+      .where(eq(meetings.id, meetingId)).run();
   }
 }
 
