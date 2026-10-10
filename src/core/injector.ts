@@ -1,4 +1,4 @@
-import { and, eq, gt } from 'drizzle-orm';
+import { and, asc, eq, gt } from 'drizzle-orm';
 import { messages, participants, type MessageRow } from '@/db/schema';
 import type { DB } from '@/db/client';
 
@@ -23,6 +23,7 @@ export function collectChatroomIncrement(
       eq(messages.channel, 'chatroom'),
       gt(messages.id, p.lastInjectedMsgId),
     ))
+    .orderBy(asc(messages.id))
     .all();
 }
 

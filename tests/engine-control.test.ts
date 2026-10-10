@@ -48,25 +48,32 @@ describe('会议控制', () => {
     expect(() => engine.start(m.id)).toThrow(/结束/);
   });
 
-  it('崩溃重建：onRestart 后 catchUp 按水位线补发增量', () => {
+  it('崩溃重建：onRestart 后按水位线补发增量（开区间，不重发已送达）', () => {
     const { db, engine, m, sessions } = setupEngine();
     engine.start(m.id);
     const ps = engine.getParticipants(m.id);
     sessions.forEach((s) => (s.pushes = []));
-    engine.sendUserMessage(m.id, '崩溃前的消息');
-    // active 期间广播是同步的（推送即推进水位线），崩溃窗口「消息已落库但未送达」
-    // 的等价状态是水位线未推进——回拨构造，验证 catchUp 补发路径
+    const delivered = engine.sendUserMessage(m.id, '正常送达的消息A');
+    engine.sendUserMessage(m.id, '崩溃丢失的消息B1');
+    engine.sendUserMessage(m.id, '崩溃丢失的消息B2');
+    // active 广播同步推进水位线；回拨到最后一条已送达消息，构造
+    // 「A 已送达、B1/B2 崩溃窗口丢失」的等价状态（验证 gt 开区间）
     db.update(participantsTable)
-      .set({ lastInjectedMsgId: 0 })
+      .set({ lastInjectedMsgId: delivered.id })
       .where(eq(participantsTable.id, ps[0].id)).run();
     sessions[0].pushes = [];
     sessions[0].opts.callbacks.onRestart();
     expect(sessions[0].pushes.length).toBe(1);
-    expect(sessions[0].pushes[0].text).toContain('关注后续推送'); // catchUp 默认指令
-    expect(sessions[0].pushes[0].text).toContain('崩溃前的消息'); // 水位线之后的增量
+    const text = sessions[0].pushes[0].text;
+    expect(text).toContain('关注后续推送');
+    expect(text).toContain('崩溃丢失的消息B1');
+    expect(text).toContain('崩溃丢失的消息B2');
+    expect(text.indexOf('崩溃丢失的消息B1')).toBeLessThan(text.indexOf('崩溃丢失的消息B2')); // 增量有序
+    expect(text).not.toContain('正常送达的消息A'); // 已送达不重发（gt 非 gte）
   });
 
   it('重建也失败：onDead → offline 状态，会议不受影响', () => {
+    // 完整摘除/水位线不推进/重建行为见 engine-crash.test.ts，此处仅锁定会议控制组视角
     const { engine, m, sessions } = setupEngine();
     engine.start(m.id);
     expect(() => sessions[0].opts.callbacks.onDead()).not.toThrow();
@@ -91,7 +98,8 @@ describe('动态成员管理', () => {
     expect(joinPush).toContain('中途加入');
     expect(joinPush).toContain('[chatroom 用户] 第一条历史'); // 全部历史（水位线 0）
     const p = engine.getParticipant(m.id, row.id);
-    expect(p.lastInjectedMsgId).toBeGreaterThan(0);
+    const maxId = Math.max(...engine.getMessages(m.id).map((x) => x.id));
+    expect(p.lastInjectedMsgId).toBe(maxId);
   });
 
   it('paused 会议添加成员：仅落库（resume 时统一重建）', () => {

@@ -1,4 +1,5 @@
 // tests/fake-session.ts —— dispatch/dm/control/api/crash 五个测试文件共用
+// 注意：vi.waitFor 的回调必须抛错（内部 expect 抛出）才会重试；返回 false 不算失败。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
