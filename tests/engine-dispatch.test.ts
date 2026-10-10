@@ -1,7 +1,7 @@
 // tests/engine-dispatch.test.ts
 import { describe, it, expect, vi } from 'vitest';
 import { setupEngine } from './fake-session';
-import { subscribeMeeting } from '@/lib/events';
+import { subscribeMeeting, type MeetingEvent } from '@/lib/events';
 
 describe('分发矩阵', () => {
   it('start：为每个成员建会话并推送开场指令（含开场系统消息增量）', () => {
@@ -73,7 +73,7 @@ describe('分发矩阵', () => {
     const p0 = engine.getParticipants(m.id)[0];
 
     // 正向断言：onTool 发出 agent_status 状态事件
-    const events: unknown[] = [];
+    const events: MeetingEvent[] = [];
     const unsubscribe = subscribeMeeting(m.id, (e) => events.push(e));
     sessions[0].opts.callbacks.onTool('Read', '/a.ts');
     await vi.waitFor(() => {
@@ -81,7 +81,7 @@ describe('分发矩阵', () => {
         (e) => e.type === 'agent_status'
           && e.participantId === p0.id
           && e.status === 'tool'
-          && (e.detail as string).includes('Read /a.ts'),
+          && e.detail?.includes('Read /a.ts'),
       )) throw new Error('未收到 agent_status(tool) 事件');
     });
     unsubscribe();
