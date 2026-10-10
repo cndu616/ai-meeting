@@ -16,7 +16,7 @@ export default function ChatPanel({
   bottomRef: RefObject<HTMLDivElement | null>;
 }) {
   const [text, setText] = useState('');
-  const byAgent = new Map(participants.map((p) => [p.agentId, p]));
+  const byId = new Map(participants.map((p) => [p.id, p]));
 
   const send = () => {
     const t = text.trim();
@@ -43,14 +43,13 @@ export default function ChatPanel({
               </div>
             );
           }
-          const p = m.agentId ? byAgent.get(m.agentId) : undefined;
+          const p = m.participantId ? byId.get(m.participantId) : undefined;
           return (
             <div key={m.id} className="flex gap-2">
-              <span className="text-xl">{p?.agent.avatar ?? '🤖'}</span>
+              <span className="text-xl">{p?.avatar ?? '🤖'}</span>
               <div>
                 <p className="text-xs text-gray-500">
-                  {p?.agent.name ?? '未知'} · {p?.agent.capability}
-                  {m.round != null && ` · 第 ${m.round} 轮`}
+                  {p?.displayName ?? '未知'} · {p?.capability}
                 </p>
                 <div className="mt-0.5 max-w-[85%] whitespace-pre-wrap rounded-lg bg-gray-100 px-3 py-2 text-sm">
                   {m.content}

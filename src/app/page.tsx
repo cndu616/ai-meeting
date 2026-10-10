@@ -44,7 +44,7 @@ export default async function Home() {
               </div>
               <p className="mt-1 text-sm text-gray-600">{m.topic}</p>
               <p className="mt-1 text-xs text-gray-400">
-                轮次 {m.currentRound}/{m.maxRounds} · {new Date(m.createdAt).toLocaleString()}
+                {new Date(m.createdAt).toLocaleString()}
               </p>
             </Link>
           </li>
