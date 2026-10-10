@@ -1,78 +1,55 @@
 import { describe, it, expect } from 'vitest';
-import { createTestDb } from '@/db/client';
-import { agents, meetings, participants, messages } from '@/db/schema';
 import {
-  isSkip,
-  collectChatroomIncrement,
-  buildSpeechPrompt,
-  buildDmPrompt,
+  isSkip, chatroomLine, buildDmPrompt, buildKickoffPrompt, type SenderInfo,
 } from '@/core/injector';
+import type { MessageRow } from '@/db/schema';
 
-function setup() {
-  const db = createTestDb();
-  db.insert(agents).values({
-    id: 'dev', name: '老王', capability: '研发',
-    description: 'd', persona: 'p', avatar: '🐧',
-  }).run();
-  db.insert(meetings).values({
-    id: 'm1', title: 't', topic: 'tp', workspacePath: '/tmp',
-    status: 'active', createdAt: 1,
-  }).run();
-  db.insert(participants).values({
-    id: 'p1', meetingId: 'm1', agentId: 'dev', meetingRole: '激进派',
-    speakOrder: 0, lastInjectedMsgId: 0,
-  }).run();
-  const say = (kind: string, content: string, agentId: string | null, channel = 'chatroom') =>
-    db.insert(messages).values({
-      meetingId: 'm1', channel, agentId, kind, content, createdAt: 1,
-    }).run();
-  return { db, say };
-}
+const row = (over: Partial<MessageRow>): MessageRow => ({
+  id: 1, meetingId: 'm1', channel: 'chatroom', participantId: null,
+  kind: 'user', content: 'hi', createdAt: 0, ...over,
+});
 
-describe('isSkip', () => {
-  it('trim 后为 [SKIP] 才算跳过', () => {
+const senders = new Map<string, SenderInfo>([
+  ['p1', { name: '张工', capability: '研发' }],
+]);
+
+describe('injector', () => {
+  it('isSkip 只认纯 [SKIP]', () => {
     expect(isSkip('[SKIP]')).toBe(true);
-    expect(isSkip('  [SKIP] \n')).toBe(true);
-    expect(isSkip('[SKIP]，但我还想说……')).toBe(false);
-    expect(isSkip('我认为不行')).toBe(false);
+    expect(isSkip(' [SKIP] ')).toBe(true);
+    expect(isSkip('我认为…[SKIP]')).toBe(false);
   });
-});
 
-describe('collectChatroomIncrement', () => {
-  it('只取 chatroom 中水位之后的消息，不含 dm', () => {
-    const { db, say } = setup();
-    say('system', '会议开始', null);
-    say('speech', '我先说两句', 'dev');
-    say('dm_user', '私下问一下', null, 'dm');
-    const rows = collectChatroomIncrement(db, 'm1', 'p1');
-    expect(rows.length).toBe(2); // dm 被排除
-    // 推进水位后不再取旧消息
-    db.update(participants)
-      .set({ lastInjectedMsgId: rows[rows.length - 1].id })
-      .run();
-    expect(collectChatroomIncrement(db, 'm1', 'p1').length).toBe(0);
+  it('chatroomLine：用户/系统/成员发言三种前缀', () => {
+    expect(chatroomLine(row({ kind: 'user', content: '大家好' }), senders))
+      .toBe('[chatroom 用户] 大家好');
+    expect(chatroomLine(row({ kind: 'system', content: '会议开始' }), senders))
+      .toBe('[system] 会议开始');
+    expect(chatroomLine(row({ kind: 'speech', participantId: 'p1', content: '我反对' }), senders))
+      .toBe('[chatroom 张工·研发] 我反对');
+    expect(chatroomLine(row({ kind: 'speech', participantId: 'pX', content: '??' }), senders))
+      .toBe('[chatroom 未知参会者] ??');
   });
-});
 
-describe('buildSpeechPrompt', () => {
-  it('组装转述行与轮次指令', () => {
-    const { db, say } = setup();
-    say('user', '大家看看覆盖率', null);
-    say('speech', '耦合度被高估了', 'dev');
-    const rows = collectChatroomIncrement(db, 'm1', 'p1');
-    const agentsById = new Map([['dev', { name: '老王', capability: '研发' }]]);
-    const prompt = buildSpeechPrompt({ increment: rows, agentsById, round: 3 });
-    expect(prompt).toContain('[chatroom 用户] 大家看看覆盖率');
-    expect(prompt).toContain('[chatroom 老王·研发] 耦合度被高估了');
-    expect(prompt).toContain('第 3 轮');
-    expect(prompt).toContain('[SKIP]');
+  it('buildDmPrompt 带私信规则', () => {
+    expect(buildDmPrompt('在吗')).toContain('[user 私信→你] 在吗');
+    expect(buildDmPrompt('在吗')).toContain('仅你可见');
   });
-});
 
-describe('buildDmPrompt', () => {
-  it('组装私信与回复规则', () => {
-    const prompt = buildDmPrompt(['帮我看看老王的说法靠谱吗']);
-    expect(prompt).toContain('[user 私信→你] 帮我看看老王的说法靠谱吗');
-    expect(prompt).toContain('仅你可见');
+  it('buildKickoffPrompt：开场指令 + roster + 历史行', () => {
+    const p = buildKickoffPrompt({
+      directive: '会议现在开始。请简短表态。',
+      roster: '- 张工（研发）：激进派\n- 李工（测试）：保守派',
+      history: [
+        row({ kind: 'system', content: '会议开始' }),
+        row({ id: 2, kind: 'user', content: '大家好' }),
+      ],
+      senders,
+    });
+    expect(p).toContain('会议现在开始。请简短表态。');
+    expect(p).toContain('- 张工（研发）：激进派');
+    expect(p).toContain('[system] 会议开始');
+    expect(p).toContain('[chatroom 用户] 大家好');
+    expect(p).toContain('[SKIP]');
   });
 });

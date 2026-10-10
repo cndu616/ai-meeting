@@ -27,35 +27,39 @@ export function collectChatroomIncrement(
 }
 
 export interface SenderInfo {
-  name: string;
+  name: string; // displayName
   capability: string;
 }
 
-function chatroomLine(row: MessageRow, agentsById: Map<string, SenderInfo>): string {
+/** 把一条聊天室消息渲染为推送给 agent 的文本行 */
+export function chatroomLine(row: MessageRow, senders: Map<string, SenderInfo>): string {
   if (row.kind === 'user') return `[chatroom 用户] ${row.content}`;
   if (row.kind === 'system') return `[system] ${row.content}`;
-  const a = row.agentId ? agentsById.get(row.agentId) : undefined;
-  const label = a ? `${a.name}·${a.capability}` : '未知参会者';
+  const s = row.participantId ? senders.get(row.participantId) : undefined;
+  const label = s ? `${s.name}·${s.capability}` : '未知参会者';
   return `[chatroom ${label}] ${row.content}`;
 }
 
-export function buildSpeechPrompt(input: {
-  increment: MessageRow[];
-  agentsById: Map<string, SenderInfo>;
-  round: number;
-}): string {
-  const lines = input.increment.map((r) => chatroomLine(r, input.agentsById));
-  const head = lines.length
-    ? lines.join('\n')
-    : '（自你上次发言以来没有新的聊天室消息）';
-  return `${head}
-
-[system] 第 ${input.round} 轮，轮到你发言。基于以上最新讨论发表观点；若无话可说，只回复 ${SKIP_TOKEN}。`;
-}
-
-export function buildDmPrompt(dmContents: string[]): string {
-  const lines = dmContents.map((c) => `[user 私信→你] ${c}`).join('\n');
-  return `${lines}
+export function buildDmPrompt(content: string): string {
+  return `[user 私信→你] ${content}
 
 [system] 以上是用户发给你的私信（仅你可见，其他参会者看不到）。请直接回复用户，回复同样仅用户可见、不会进入聊天室。`;
+}
+
+/** 开场/恢复/入会共用的指令构造器：指令 + 花名册 + 历史消息行 */
+export function buildKickoffPrompt(input: {
+  directive: string;
+  roster?: string;
+  history: MessageRow[];
+  senders: Map<string, SenderInfo>;
+}): string {
+  const parts: string[] = [input.directive];
+  if (input.roster) parts.push(`# 参会者\n${input.roster}`);
+  if (input.history.length) {
+    parts.push(
+      `# 最新讨论记录\n${input.history.map((r) => chatroomLine(r, input.senders)).join('\n')}`,
+    );
+  }
+  parts.push(`[system] 请基于以上内容发言表态；若无话可说，只回复 ${SKIP_TOKEN}。`);
+  return parts.join('\n\n');
 }
