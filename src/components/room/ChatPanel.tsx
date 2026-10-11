@@ -26,7 +26,7 @@ export default function ChatPanel({
   };
 
   return (
-    <section className="flex flex-1 flex-col">
+    <section className="flex min-h-0 flex-1 flex-col">
       <div className="flex-1 space-y-3 overflow-y-auto p-4">
         {messages.map((m) => {
           if (m.kind === 'system') {

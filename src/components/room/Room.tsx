@@ -176,7 +176,7 @@ export default function Room({ initial }: { initial: RoomData }) {
         </div>
       </aside>
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {sseWarn && (
           <div className="shrink-0 border-b border-yellow-300 bg-yellow-50 px-4 py-1.5 text-xs text-yellow-800">
             ⚠ 收到 {sseWarn.count} 条无法解析的事件（最近：{sseWarn.lastReason}）。
