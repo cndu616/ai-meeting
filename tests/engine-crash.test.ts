@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { participants as participantsTable } from '@/db/schema';
 import { setupEngine } from './fake-session';
 
@@ -35,6 +35,8 @@ describe('崩溃路径（审查修复）', () => {
     const { engine, m, sessions } = setupEngine();
     const ps = engine.getParticipants(m.id);
     const dmPromise = engine.sendDm(m.id, ps[0].id, '暂停时也找你');
+    // DM 离线走排队链（microtask 后建一次性会话），先等会话建立再取
+    await vi.waitFor(() => expect(sessions.length).toBe(1));
     const offline = sessions[0];
     expect(offline.pushes[0].kind).toBe('dm');
 

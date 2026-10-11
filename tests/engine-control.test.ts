@@ -79,6 +79,20 @@ describe('会议控制', () => {
     expect(() => sessions[0].opts.callbacks.onDead()).not.toThrow();
     expect(engine.getMeeting(m.id).status).toBe('active');
   });
+
+  it('暂停穿透拦截：paused 后迟到的 chatroom 回合结果不落库、不广播、零新消息', async () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    await engine.pause(m.id);
+    sessions.forEach((s) => (s.pushes = []));
+    // session 已关闭，但飞行中回合的 onResult 仍可能触发（close 无门卫时的在途回调）
+    const before = engine.getMessages(m.id).length;
+    sessions[0].opts.callbacks.onResult('暂停后迟到的发言', 'chatroom');
+    // 静默规格：不产生任何新消息（含系统提示），违规原文不落库
+    expect(engine.getMessages(m.id).length).toBe(before);
+    expect(engine.getMessages(m.id).some((x) => x.content === '暂停后迟到的发言')).toBe(false);
+    expect(sessions.every((s) => s.pushes.length === 0)).toBe(true);
+  });
 });
 
 describe('动态成员管理', () => {

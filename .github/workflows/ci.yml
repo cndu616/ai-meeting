@@ -1,0 +1,23 @@
+# CI 门禁：lint + tsc + vitest + build 四绿才许合，无跳过项
+# 注意：better-sqlite3 为原生模块，锁 Node LTS + npm 缓存以保证可复现构建
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run build

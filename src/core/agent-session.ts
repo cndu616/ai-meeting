@@ -148,6 +148,7 @@ export class AgentSession {
   private async consume(iter: AsyncIterable<SDKMessage>): Promise<void> {
     try {
       for await (const msg of iter) {
+        if (this.closed) continue; // 门卫：close 后迟到的输出静默丢弃——进行中的 turn 会跑完，但回调不得外泄到引擎（暂停穿透修复）
         if (msg.type === 'system' && msg.subtype === 'init') {
           // 新流成功建立即重置容错：连续失败（重建的流没等到 init 又死了）才放弃
           this.restarted = false;

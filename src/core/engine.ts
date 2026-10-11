@@ -22,9 +22,10 @@ export interface CreateMeetingInput {
   participants: { templateId: string; displayName: string; goal: string }[];
 }
 
-/** 禁言者的注入行附加提示：消息照常推送以保持上下文，但明确要求只回 [SKIP] */
-const MUTE_SUFFIX =
-  '\n（你现在被主持人禁言，请勿发言，直接回复 [SKIP]，并记住该消息作为上下文。）';
+/** 禁言语义（评审定稿）= 发言权冻结：
+ *  入口——muted 期间聊天室消息不推送、水位线不推进（token 零消耗）；
+ *  出口——muted 状态下到达的 chatroom 回合结果（飞行中回合等防御路径）拦截转系统提示；
+ *  豁免——私信是一对一问答，不在"会议发言权"语义内。 */
 
 /** 暂停态私信回合的兜底超时：防 gate 因未预见路径（如崩溃后无 result）永久挂起 */
 const DM_OFFLINE_TIMEOUT_MS = 120_000;
@@ -32,6 +33,8 @@ const DM_OFFLINE_TIMEOUT_MS = 120_000;
 export class MeetingEngine {
   /** meetingId -> participantId -> session */
   private sessions = new Map<string, Map<string, AgentSessionLike>>();
+  /** participantId -> DM 串行链：暂停态一次性会话不可并发（会并发 resume 同一 sdkSessionId 链，转录互踩） */
+  private dmChains = new Map<string, Promise<void>>();
 
   constructor(
     private db: DB,
@@ -224,16 +227,17 @@ ${this.roster(meetingId)}
     return s;
   }
 
-  /** 聊天室消息广播给所有（除发送者）在线成员；禁言者附加提示 */
+  /** 聊天室消息广播给所有（除发送者）在线成员；禁言者入口冻结（零推送、水位线不动，解除时补发） */
   private broadcastChatroom(msg: MessageRow, exceptParticipantId?: string): void {
     const senders = this.senderInfoMap(msg.meetingId);
     const sessions = this.sessionsOf(msg.meetingId);
     for (const p of this.getParticipants(msg.meetingId)) {
       if (p.id === exceptParticipantId) continue;
+      if (p.muted) continue; // 入口冻结：不推送、不推进水位线
       const s = sessions.get(p.id);
       if (!s) continue;
       const line = chatroomLine(msg, senders);
-      s.push(p.muted ? line + MUTE_SUFFIX : line);
+      s.push(line);
       this.db.update(participants)
         .set({ lastInjectedMsgId: msg.id })
         .where(eq(participants.id, p.id)).run();
@@ -265,6 +269,23 @@ ${this.roster(meetingId)}
     if (!text.trim() || isSkip(text)) {
       this.setAgentStatus(meetingId, participantId, 'idle');
       return; // [SKIP]：不落库、不分发
+    }
+    // 会议级门卫：非 active（含 paused）期间 chatroom 发言静默拦截——
+    // 防 session 已关闭/摘除但飞行回合的 onResult 仍在途的时序窗口（暂停穿透修复）
+    if (this.getMeeting(meetingId).status !== 'active') {
+      this.setAgentStatus(meetingId, participantId, 'idle');
+      return;
+    }
+    // 成员级门卫（防御路径）：入口冻结后正常不会有 muted 回合，此处兜飞行中回合等在途结果。
+    // 系统提示不引用违规原文（原文不落库、不进任何推送）
+    const p = this.getParticipant(meetingId, participantId);
+    if (p.muted) {
+      this.emitMessage(this.insertMessage({
+        meetingId, channel: 'chatroom', kind: 'system',
+        content: `${p.displayName} 已被禁言，其发言未被送达。`,
+      }));
+      this.setAgentStatus(meetingId, participantId, 'idle');
+      return;
     }
     const msg = this.insertMessage({
       meetingId, channel: 'chatroom', kind: 'speech', participantId, content: text,
@@ -337,12 +358,18 @@ ${this.roster(meetingId)}
     this.setStatus(meetingId, 'active');
     for (const p of this.getParticipants(meetingId)) {
       if (this.sessionsOf(meetingId).has(p.id)) continue;
-      this.setAgentStatus(meetingId, p.id, 'thinking');
-      this.createSessionFor(meetingId, p);
-      const resume = !!p.sdkSessionId;
-      this.catchUp(meetingId, p.id, resume
-        ? `[system] 会议「${m.title}」继续进行。`
-        : `[system] 会议「${m.title}」现在开始，主题：${m.topic}。请简短表态开场。`);
+      const launch = () => {
+        this.setAgentStatus(meetingId, p.id, 'thinking');
+        this.createSessionFor(meetingId, p);
+        const resume = !!p.sdkSessionId;
+        this.catchUp(meetingId, p.id, resume
+          ? `[system] 会议「${m.title}」继续进行。`
+          : `[system] 会议「${m.title}」现在开始，主题：${m.topic}。请简短表态开场。`);
+      };
+      const chain = this.dmChains.get(p.id);
+      // 掉线 DM 与 start 恢复并发会抢同一条 sdkSessionId 链：等一次性会话收尾再建常驻会话
+      if (chain) void chain.then(launch);
+      else launch();
     }
   }
 
@@ -415,18 +442,44 @@ ${this.roster(meetingId)}
     const m = this.getMeeting(meetingId);
     if (m.status === 'ended') throw new Error('会议已结束，无法私聊');
     const p = this.getParticipant(meetingId, participantId);
-    this.emitMessage(this.insertMessage({
-      meetingId, channel: 'dm', kind: 'dm_user', participantId: p.id, content,
-    }));
     if (m.status === 'active' && this.sessionsOf(meetingId).has(p.id)) {
-      // 常驻会话在线：直接推私信（禁言不影响私信）
+      // 常驻会话在线：直接推私信（禁言不影响私信）。push 顺序由会话内 PushQueue
+      // 天然串行，保持同步语义不走排队链
+      this.emitDmUser(meetingId, p.id, content);
       const s = this.sessionsOf(meetingId).get(p.id)!;
       this.setAgentStatus(meetingId, p.id, 'thinking', '私聊中');
       s.push(buildDmPrompt(content), 'dm');
-    } else {
-      // 暂停中：一次性会话回合（resume 原会话链，结束即关）
-      await this.runDmOffline(meetingId, p, content);
+      return;
     }
+    // 离线分支：同成员串行排队——防两个一次性会话并发 resume 同一条 sdkSessionId 链
+    const prev = this.dmChains.get(participantId) ?? Promise.resolve();
+    const run = prev.then(() => this.runDmQueued(meetingId, participantId, content));
+    this.dmChains.set(participantId, run.catch(() => {}));
+    await run;
+  }
+
+  private emitDmUser(meetingId: string, participantId: string, content: string): void {
+    this.emitMessage(this.insertMessage({
+      meetingId, channel: 'dm', kind: 'dm_user', participantId, content,
+    }));
+  }
+
+  /** 排队轮到时的执行体：重新读状态（排队期间会议可能已恢复、会话已重建） */
+  private async runDmQueued(
+    meetingId: string,
+    participantId: string,
+    content: string,
+  ): Promise<void> {
+    const m = this.getMeeting(meetingId);
+    const p = this.getParticipant(meetingId, participantId);
+    this.emitDmUser(meetingId, p.id, content);
+    if (m.status === 'active' && this.sessionsOf(meetingId).has(p.id)) {
+      const s = this.sessionsOf(meetingId).get(p.id)!;
+      this.setAgentStatus(meetingId, p.id, 'thinking', '私聊中');
+      s.push(buildDmPrompt(content), 'dm');
+      return;
+    }
+    await this.runDmOffline(meetingId, p, content);
   }
 
   /** 暂停状态下的一次性私聊回合 */
@@ -439,6 +492,7 @@ ${this.roster(meetingId)}
     let done!: () => void;
     const gate = new Promise<void>((r) => (done = r));
     let settled = false;
+    let timedOut = false;
     const finish = () => {
       if (settled) return;
       settled = true;
@@ -458,6 +512,18 @@ ${this.roster(meetingId)}
         onTool: (tool, detail) =>
           this.setAgentStatus(meetingId, p.id, 'tool', `${tool} ${detail}`.trim()),
         onResult: (text) => {
+          if (settled) {
+            // 超时后的迟到回复：用户已被告知超时，正文不静默吞（DM 有等待方），
+            // 转系统消息呈现并关闭会话
+            if (text.trim() && !isSkip(text)) {
+              this.emitMessage(this.insertMessage({
+                meetingId, channel: 'dm', kind: 'system', participantId: p.id,
+                content: `${p.displayName} 的私信回复姗姗来迟：${text.slice(0, 500)}`,
+              }));
+            }
+            void session.close().catch(() => {});
+            return;
+          }
           this.handleAgentResult(meetingId, p.id, text, 'dm');
           finish();
         },
@@ -466,6 +532,11 @@ ${this.roster(meetingId)}
           session.push(buildDmPrompt(content), 'dm');
         },
         onDead: () => {
+          if (settled) {
+            // 超时后会话已收尾说明：流结束仅作清理信号，不再落失败消息
+            void session.close().catch(() => {});
+            return;
+          }
           this.emitMessage(this.insertMessage({
             meetingId, channel: 'dm', kind: 'system', participantId: p.id,
             content: `${p.displayName} 私信回复失败。`,
@@ -478,6 +549,7 @@ ${this.roster(meetingId)}
     session.push(buildDmPrompt(content), 'dm');
     const timeout = setTimeout(() => {
       if (settled) return;
+      timedOut = true;
       this.emitMessage(this.insertMessage({
         meetingId, channel: 'dm', kind: 'system', participantId: p.id,
         content: `${p.displayName} 私信回复超时。`,
@@ -485,7 +557,8 @@ ${this.roster(meetingId)}
       finish();
     }, DM_OFFLINE_TIMEOUT_MS);
     await gate.then(() => clearTimeout(timeout));
-    await session.close();
+    // 超时不立即关会话：SDK 的 turn 可能仍在跑，迟到回复需能通行（由 onResult/onDead 收尾关闭）
+    if (!timedOut) await session.close();
     this.setAgentStatus(meetingId, p.id, 'idle');
   }
 
@@ -540,6 +613,14 @@ ${this.roster(meetingId)}
       .where(eq(participants.id, p.id)).run();
     const updated = this.getParticipant(meetingId, participantId);
     emitMeetingEvent({ type: 'participant', meetingId, participant: this.participantInfo(updated) });
+    // 解除禁言：补发冻结期间增量。指令必须显式说明此前被禁言——
+    // 不给这句，agent 补完课容易一口气发长篇，等于解除禁言当场广播风暴
+    if (!muted
+      && this.getMeeting(meetingId).status === 'active'
+      && this.sessionsOf(meetingId).has(participantId)) {
+      this.catchUp(meetingId, participantId,
+        '[system] 你此前被主持人禁言，以下是禁言期间的讨论增量，请简短回应后继续参与讨论。');
+    }
     return updated;
   }
 }

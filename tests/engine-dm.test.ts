@@ -44,8 +44,10 @@ describe('私聊', () => {
   it('paused 会议：DM 走一次性会话（回复后关闭）', async () => {
     const { engine, m, sessions } = setupEngine();
     const ps = engine.getParticipants(m.id);
-    // 不 start：会议 paused，工厂此时创建一次性 FakeSession（sessions[0]）
+    // 不 start：会议 paused，工厂此时创建一次性 FakeSession（sessions[0]）；
+    // 离线 DM 走排队链（microtask 后建会话），先等会话建立再取
     const dmPromise = engine.sendDm(m.id, ps[0].id, '暂停时也找你');
+    await vi.waitFor(() => expect(sessions.length).toBe(1));
     const offline = sessions[0];
     expect(offline.started).toBe(true);
     expect(offline.pushes[0].kind).toBe('dm');
@@ -61,6 +63,7 @@ describe('私聊', () => {
     const { engine, m, sessions } = setupEngine();
     const ps = engine.getParticipants(m.id);
     const dmPromise = engine.sendDm(m.id, ps[0].id, '在吗');
+    await vi.waitFor(() => expect(sessions.length).toBe(1));
     const offline = sessions[0];
     offline.opts.callbacks.onDead();
     await dmPromise; // onDead 也必须 finish，否则要等 120s 超时兜底
@@ -70,7 +73,7 @@ describe('私聊', () => {
     expect(dmMsgs[1].content).toContain('私信回复失败');
   });
 
-  it('paused 私聊超时：120s 落 system 超时消息、关闭会话、状态回 idle', async () => {
+  it('paused 私聊超时：120s 落 system 超时消息、状态回 idle（会话留待迟到回复后关闭）', async () => {
     vi.useFakeTimers();
     try {
       const { engine, m, sessions } = setupEngine();
@@ -81,16 +84,66 @@ describe('私聊', () => {
         if (e.type === 'agent_status') statuses.push({ participantId: e.participantId, status: e.status });
       });
       const dmPromise = engine.sendDm(m.id, ps[0].id, '超时测试');
+      await vi.advanceTimersByTimeAsync(0); // flush 排队链：一次性会话已建立
       const offline = sessions[0];
       vi.advanceTimersByTime(120_000);
       await dmPromise;
       off();
-      expect(offline.closed).toBe(true);
       const dmMsgs = engine.getMessages(m.id).filter((x) => x.channel === 'dm');
       expect(dmMsgs.map((x) => x.kind)).toEqual(['dm_user', 'system']);
       expect(dmMsgs[1].content).toContain('私信回复超时');
       const last = statuses[statuses.length - 1];
       expect(last).toEqual({ participantId: ps[0].id, status: 'idle' });
+      // 超时不立即关会话：SDK 的 turn 可能仍在跑，迟到回复需能通行
+      offline.opts.callbacks.onResult('迟到的正文', 'dm');
+      expect(offline.closed).toBe(true);
+      expect(engine.getMessages(m.id).some(
+        (x) => x.kind === 'system' && x.channel === 'dm' && x.content.includes('姗姗来迟'),
+      )).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('paused 连发两条私信给同一成员：串行排队，第二轮等第一轮收尾后才建会话（并发修复）', async () => {
+    const { engine, m, sessions } = setupEngine();
+    const ps = engine.getParticipants(m.id);
+    const first = engine.sendDm(m.id, ps[0].id, '私信一');
+    const second = engine.sendDm(m.id, ps[0].id, '私信二');
+    await vi.waitFor(() => expect(sessions.length).toBe(1)); // 第一轮排队链已建会话
+    const offline1 = sessions[0];
+    // 排队语义：第一轮未收尾前，不得并发建第二个一次性会话（避免并发 resume 同一 sdkSessionId 链）
+    expect(sessions.length).toBe(1);
+    offline1.opts.callbacks.onResult('回一', 'dm');
+    await first;
+    await vi.waitFor(() => expect(sessions.length).toBe(2)); // 第一轮收尾后第二轮才开跑
+    sessions[1].opts.callbacks.onResult('回二', 'dm');
+    await second;
+    // 两轮消息严格按序交错，不出现转录竞争
+    const dmKinds = engine.getMessages(m.id)
+      .filter((x) => x.channel === 'dm')
+      .map((x) => x.kind);
+    expect(dmKinds).toEqual(['dm_user', 'dm_agent', 'dm_user', 'dm_agent']);
+  });
+
+  it('paused 私信超时后迟到回复：不落正常 dm_agent，转「姗姗来迟」系统消息（DM 有等待方）', async () => {
+    vi.useFakeTimers();
+    try {
+      const { engine, m, sessions } = setupEngine();
+      const ps = engine.getParticipants(m.id);
+      const dmPromise = engine.sendDm(m.id, ps[0].id, '超时后回复测试');
+      await vi.advanceTimersByTimeAsync(0); // flush 排队链：一次性会话已建立
+      const offline = sessions[0];
+      vi.advanceTimersByTime(120_000);
+      await dmPromise;
+      offline.opts.callbacks.onResult('这是一条迟到的回复正文', 'dm');
+      const dmMsgs = engine.getMessages(m.id).filter((x) => x.channel === 'dm');
+      expect(dmMsgs.some(
+        (x) => x.kind === 'dm_agent' && x.content === '这是一条迟到的回复正文',
+      )).toBe(false);
+      expect(dmMsgs.some(
+        (x) => x.kind === 'system' && x.content.includes('姗姗来迟'),
+      )).toBe(true);
     } finally {
       vi.useRealTimers();
     }

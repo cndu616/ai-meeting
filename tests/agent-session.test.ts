@@ -122,6 +122,23 @@ describe('AgentSession', () => {
     expect(h.pushed.length).toBe(0);
   });
 
+  it('close 后迟到的输出静默丢弃：result/tool 回调不外泄（暂停穿透修复规格）', async () => {
+    const h = makeHarness();
+    const s = makeSession(h.factory, h.cbs);
+    s.push('第一条');
+    await vi.waitFor(() => expect(h.pushed.length).toBe(1));
+    h.streams[0].emit(initMsg);
+    await vi.waitFor(() => expect(h.cbs.onSessionId).toHaveBeenCalledWith('s-1'));
+    // close 只关输入队列，SDK 会把进行中的 turn 跑完才退出——
+    // 此后到达的 result/tool 属于迟到输出，不得再外泄到引擎
+    await s.close();
+    h.streams[0].emit(toolMsg('Read', { file_path: '/a.ts' }));
+    h.streams[0].emit(okResult('暂停后迟到的心声'));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.cbs.onResult).not.toHaveBeenCalled();
+    expect(h.cbs.onTool).not.toHaveBeenCalled();
+  });
+
   it('流意外结束：自动重建一次并回调 onRestart；再次结束回调 onDead', async () => {
     const h = makeHarness();
     const s = makeSession(h.factory, h.cbs, 'old-session');

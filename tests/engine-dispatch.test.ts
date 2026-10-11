@@ -55,16 +55,15 @@ describe('分发矩阵', () => {
     expect(sessions.every((s) => s.pushes.length === 0)).toBe(true);
   });
 
-  it('禁言成员：仍收到广播但带禁言后缀', () => {
+  it('禁言成员：入口冻结，零推送（旧"带禁言后缀"语义已废弃）', () => {
     const { engine, m, sessions } = setupEngine();
     engine.start(m.id);
     const ps = engine.getParticipants(m.id);
     engine.setMuted(m.id, ps[1].id, true);
     sessions.forEach((s) => (s.pushes = []));
     engine.sendUserMessage(m.id, '继续');
-    expect(sessions[1].pushes[0].text).toContain('禁言');
-    expect(sessions[1].pushes[0].text).toContain('[chatroom 用户] 继续');
-    expect(sessions[0].pushes[0].text).not.toContain('禁言');
+    expect(sessions[1].pushes.length).toBe(0); // 禁言者零推送
+    expect(sessions[0].pushes[0].text).toContain('[chatroom 用户] 继续'); // 未禁言者正常
   });
 
   it('工具活动：仅状态事件，不进聊天室', async () => {
