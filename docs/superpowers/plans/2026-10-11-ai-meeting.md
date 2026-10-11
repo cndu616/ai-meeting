@@ -1,5 +1,7 @@
 # AI Meeting 实现计划
 
+> **状态：已被实际实现取代（2026-10-11 标注，仅作史料）**——本文针对的 v1 轮流发言架构已为常驻流式会话架构取代，权威现状见 `../specs/2026-10-11-persistent-streaming-design.md`。勿据此实施或理解现行系统。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 多 Agent 会议系统——多个平等 agent 轮流讨论话题，用户群聊 + 私聊双通道参与，会议持久化可召回继续。
