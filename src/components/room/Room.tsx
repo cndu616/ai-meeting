@@ -10,6 +10,7 @@ import type { RoomData, AgentStatus } from './types';
 import type { MeetingEvent } from '@/lib/events';
 import { shouldPauseOnPageHide, pauseBeaconUrl, shouldResyncOnPageShow } from './pageHidePause';
 import { mergeMessage } from './chatMessages';
+import { canToggleMute } from './meetingControls';
 
 export type { ParticipantView, RoomData } from './types';
 
@@ -158,7 +159,7 @@ export default function Room({ initial }: { initial: RoomData }) {
               key={p.id}
               participant={p}
               state={states[p.id] ?? { status: 'idle' }}
-              meetingActive={meeting.status === 'active'}
+              canToggleMute={canToggleMute(meeting.status)}
               onDm={() => setDmTarget(p.id)}
               onToggleMute={() => toggleMute(p.id, !p.muted)}
             />

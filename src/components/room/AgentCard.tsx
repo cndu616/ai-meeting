@@ -12,13 +12,13 @@ const stateLabel: Record<string, string> = {
 export default function AgentCard({
   participant,
   state,
-  meetingActive,
+  canToggleMute,
   onDm,
   onToggleMute,
 }: {
   participant: ParticipantView;
   state: { status: AgentStatus; detail?: string };
-  meetingActive: boolean;
+  canToggleMute: boolean;
   onDm: () => void;
   onToggleMute: () => void;
 }) {
@@ -33,7 +33,8 @@ export default function AgentCard({
           <button onClick={onDm} className="text-[10px] text-blue-600 hover:underline">
             私聊
           </button>
-          {meetingActive && (
+          {/* 禁言是成员级配置，与会议运行状态无关（paused 可用）；ended 终态下无意义，语义见 meetingControls.ts */}
+          {canToggleMute && (
             <button
               onClick={onToggleMute}
               className={`text-[10px] hover:underline ${participant.muted ? 'text-red-600' : 'text-gray-500'}`}
