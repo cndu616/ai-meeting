@@ -3,8 +3,6 @@ import { notFound } from 'next/navigation';
 import { getEngine } from '@/core/engine-instance';
 import Room, { type RoomData } from '@/components/room/Room';
 
-export const instant = false;
-
 export default async function MeetingPage({
   params,
 }: {

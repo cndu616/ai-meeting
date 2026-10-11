@@ -5,8 +5,9 @@ import { getDb } from '@/db/client';
 import { meetings } from '@/db/schema';
 import { loadAgentFiles, importAgentsToDb } from '@/core/agent-config';
 
-// 列表页实时读取数据库，阻塞渲染而非流式（本地工具优先简单）
-export const instant = false;
+// 列表页实时读取数据库：await connection() 标记动态渲染（build 不做静态预生成，
+// 运行时每次请求现读）。曾用 cacheComponents + instant=false 表达，因 Next 16.4.0
+// 的 /_global-error 预渲染 bug 退出该模式（见 next.config.ts 注释）。
 
 const statusLabel: Record<string, string> = {
   active: '进行中',
