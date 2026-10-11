@@ -23,6 +23,16 @@ export interface AgentSessionCallbacks {
   onRestart(): void;
   /** 重建也失败，该成员掉线 */
   onDead(): void;
+  /**
+   * 决议 1（B+）：close 时仍有未销账的 push（在途回合无 result）——引擎落痕迹消息
+   * （措辞不说死"已丢弃"：迟到内容大概率会经 onLateResult 跟到）。
+   */
+  onDiscard(): void;
+  /**
+   * 决议 1（B+）：closed 后到达的迟到 result 转交（SDK 会把进行中的 turn 跑完）。
+   * kind 经 resolveResultKind 判定——红线：dm 迟到回复只准走 dm 通道，绝不广播。
+   */
+  onLateResult(text: string, kind: PushKind): void;
 }
 
 export type QueryFactory = (input: {
@@ -139,16 +149,41 @@ export class AgentSession {
   /**
    * 请求关闭：关闭输入队列，SDK 会把进行中的 turn 跑完才退出；
    * 本方法不等待该过程，立即 resolve。
+   * 决议 1（B+）：存在未销账 push（在途回合）时通知引擎落痕迹消息——
+   * 否则转录与会议记录分叉、飞行中私信回复永不到达，且无任何痕迹。
    */
   async close(): Promise<void> {
     this.closed = true;
     this.queue.close();
+    if (this.pendingSends.size > 0) {
+      try {
+        this.opts.callbacks.onDiscard();
+      } catch (err) {
+        console.error('[AgentSession] onDiscard 回调执行异常', err);
+      }
+    }
   }
 
   private async consume(iter: AsyncIterable<SDKMessage>): Promise<void> {
     try {
       for await (const msg of iter) {
-        if (this.closed) continue; // 门卫：close 后迟到的输出静默丢弃——进行中的 turn 会跑完，但回调不得外泄到引擎（暂停穿透修复）
+        if (this.closed) {
+          // 决议 1（B+）改写原门卫：close 后 tool/中间输出仍静默丢弃，但 result 不再吞——
+          // 进行中的 turn 会跑完，内容到手了扔掉等于转录与会议记录分叉、私信回复永不到达。
+          // 分通道转交（红线：dm 只走 dm 通道）；空文本（error turn）无内容可保，照吞。
+          if (msg.type === 'result') {
+            const kind = this.resolveResultKind(msg);
+            const text = msg.subtype === 'success' ? (msg.result ?? '') : '';
+            if (text.trim()) {
+              try {
+                this.opts.callbacks.onLateResult(text, kind);
+              } catch (err) {
+                console.error('[AgentSession] onLateResult 回调执行异常', err);
+              }
+            }
+          }
+          continue;
+        }
         if (msg.type === 'system' && msg.subtype === 'init') {
           // 新流成功建立即重置容错：连续失败（重建的流没等到 init 又死了）才放弃
           this.restarted = false;

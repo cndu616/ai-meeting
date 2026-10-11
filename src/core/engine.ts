@@ -1,7 +1,7 @@
 // src/core/engine.ts
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq } from 'drizzle-orm';
 import {
   agents, meetings, participants, messages,
   type AgentRow, type MeetingRow, type MessageRow, type ParticipantRow,
@@ -184,7 +184,15 @@ export class MeetingEngine {
   buildSystemPrompt(meetingId: string, participantId: string): string {
     const m = this.getMeeting(meetingId);
     const p = this.getParticipant(meetingId, participantId);
-    const t = this.agentMap().get(p.templateId)!;
+    const am = this.agentMap();
+    const t = am.get(p.templateId)!;
+    // 决议 4 修复项：格式说明用真实推送格式举例，动态指认"哪行是自己"——
+    // 晚入场者的历史全为带标签格式，in-context 模仿会压倒指令语义（双前缀实弹），
+    // 且发言者收不到自己的广播、对瑕疵无感知。只给正例不给反例（负例有模仿引力）
+    const other = this.getParticipants(meetingId).find((x) => x.id !== participantId)!;
+    const otherT = am.get(other.templateId);
+    const selfTag = `[chatroom ${p.displayName}·${t.capability}]`;
+    const otherTag = `[chatroom ${other.displayName}·${otherT?.capability ?? ''}]`;
     return `# 你的身份
 你是「${p.displayName}」，本会议中的${t.capability}。${t.persona}
 
@@ -197,6 +205,17 @@ ${p.goal}
 
 # 参会者
 ${this.roster(meetingId)}
+
+# 消息格式
+推送给你的每条消息，开头都有一个系统自动加的方括号标签，标明发言者。实际格式示例：
+
+[chatroom 用户] 大家继续讨论下一个议题
+${otherTag} 我同意这个方案
+${selfTag} 我补充一点……
+[user 私信→你] 咱们私下交换一下看法
+
+示例中的「${selfTag}」这一行就是你自己（${p.displayName}）——系统会给你的每条发言自动加上这个标签，再广播给其他参会者；「${otherTag}」等其他标签对应其他参会者。你平时收不到自己发言的推送，只在入会、恢复或解禁补发记录时才会看到带自己标签的行。
+你发言时，正文直接从内容写起——不要在开头添加任何 [chatroom …] 样式的标签，标签由系统自动添加。
 
 # 行为规则
 - 会议以自由讨论方式进行：聊天室的新消息会实时推送给你，你自主判断是否发言
@@ -280,10 +299,13 @@ ${this.roster(meetingId)}
     // 系统提示不引用违规原文（原文不落库、不进任何推送）
     const p = this.getParticipant(meetingId, participantId);
     if (p.muted) {
-      this.emitMessage(this.insertMessage({
+      const blocked = this.insertMessage({
         meetingId, channel: 'chatroom', kind: 'system',
         content: `${p.displayName} 已被禁言，其发言未被送达。`,
-      }));
+      });
+      this.emitMessage(blocked);
+      // 决议 2 同根同修：拦截提示也走广播（原只 emitMessage 给 UI，agent 看不到）
+      this.broadcastChatroom(blocked);
       this.setAgentStatus(meetingId, participantId, 'idle');
       return;
     }
@@ -293,6 +315,62 @@ ${this.roster(meetingId)}
     this.emitMessage(msg);
     this.setAgentStatus(meetingId, participantId, 'idle');
     this.broadcastChatroom(msg, participantId);
+  }
+
+  /** 决议 1（B+）：closed 后迟到 result 的分通道转交落库。
+   *  红线：dm 迟到回复只落 dm channel（宁漏播不泄漏）；chatroom 迟到发言落系统
+   *  消息并广播——paused/无会话时自然无人收，恢复靠 catchUp 增量补看 */
+  private handleLateResult(
+    meetingId: string,
+    participantId: string,
+    text: string,
+    kind: 'chatroom' | 'dm',
+  ): void {
+    if (!text.trim() || isSkip(text)) return;
+    const p = this.getParticipant(meetingId, participantId);
+    if (kind === 'dm') {
+      this.emitMessage(this.insertMessage({
+        meetingId, channel: 'dm', kind: 'system', participantId: p.id,
+        content: `${p.displayName} 的私信回复姗姗来迟：${text.slice(0, 500)}`,
+      }));
+      return;
+    }
+    const late = this.insertMessage({
+      meetingId, channel: 'chatroom', kind: 'system',
+      content: `${p.displayName} 的在途发言（迟到）：${text.slice(0, 500)}`,
+    });
+    this.emitMessage(late);
+    this.broadcastChatroom(late, participantId);
+  }
+
+  /** 决议 1（B+）：close 时存在未销账 push → 痕迹消息。
+   *  措辞不说死"丢弃"：SDK 会把进行中的 turn 跑完，迟到内容大概率经 onLateResult 跟到 */
+  private handleDiscard(meetingId: string, participantId: string): void {
+    const p = this.getParticipant(meetingId, participantId);
+    this.emitMessage(this.insertMessage({
+      meetingId, channel: 'chatroom', kind: 'system',
+      content: `${p.displayName} 暂停时有一回合在途，结果稍后送达或超时作废。`,
+    }));
+  }
+
+  /** 决议 1（B+）第 3 点：恢复对账——最后一条 dm 是 dm_user（无任何回应）则补推，
+   *  防飞行中私信回复被暂停吞掉后用户永无回音。超时/失败/迟到类 dm system 算已回应。
+   *  接受与迟到回复的一次性双发，不上跨会话去重（决议 1 第 5 点） */
+  private reinjectUnansweredDm(meetingId: string, participantId: string): void {
+    const s = this.sessionsOf(meetingId).get(participantId);
+    if (!s) return;
+    const last = this.db.select().from(messages)
+      .where(and(
+        eq(messages.meetingId, meetingId),
+        eq(messages.channel, 'dm'),
+        eq(messages.participantId, participantId),
+      ))
+      .orderBy(desc(messages.id))
+      .limit(1)
+      .get();
+    if (last?.kind === 'dm_user') {
+      s.push(buildDmPrompt(last.content), 'dm');
+    }
   }
 
   /** 创建常驻会话并接线回调 */
@@ -311,6 +389,8 @@ ${this.roster(meetingId)}
         onTool: (tool, detail) =>
           this.setAgentStatus(meetingId, p.id, 'tool', `${tool} ${detail}`.trim()),
         onResult: (text, kind) => this.handleAgentResult(meetingId, p.id, text, kind),
+        onLateResult: (text, kind) => this.handleLateResult(meetingId, p.id, text, kind),
+        onDiscard: () => this.handleDiscard(meetingId, p.id),
         onRestart: () => this.catchUp(meetingId, p.id),
         onDead: () => {
           // 掉线即摘除会话：broadcast 自动跳过（水位线不推进，消息留待恢复时 catchUp 补发），
@@ -330,6 +410,10 @@ ${this.roster(meetingId)}
     const sessions = this.sessionsOf(meetingId);
     const s = sessions.get(participantId);
     if (!s) return;
+    // 决议 4 回写时裁决（陈指出的实现不一致）：冻结含重建补发——muted 成员
+    // 崩溃重建也不 catchUp，零消耗语义贯彻所有路径；水位不动，解禁时
+    // setMuted 的 catchUp 补完整增量（不丢不重）。私信豁免不受影响（不走此路径）
+    if (this.getParticipant(meetingId, participantId).muted) return;
     const increment = collectChatroomIncrement(this.db, meetingId, participantId);
     const text = buildKickoffPrompt({
       directive:
@@ -365,6 +449,8 @@ ${this.roster(meetingId)}
         this.catchUp(meetingId, p.id, resume
           ? `[system] 会议「${m.title}」继续进行。`
           : `[system] 会议「${m.title}」现在开始，主题：${m.topic}。请简短表态开场。`);
+        // 决议 1（B+）第 3 点：恢复对账——飞行中私信回复若被暂停吞掉，此处补推原私信
+        this.reinjectUnansweredDm(meetingId, p.id);
       };
       const chain = this.dmChains.get(p.id);
       // 掉线 DM 与 start 恢复并发会抢同一条 sdkSessionId 链：等一次性会话收尾再建常驻会话
@@ -412,20 +498,48 @@ ${this.roster(meetingId)}
     this.emitMessage(closing);
   }
 
-  /** 服务器重启后恢复所有 active 会议（与 resume 同路径） */
+  /** 决议 5（quarantine）：服务重启后不自动复活 active 孤儿会议。
+   * 旧语义（初始化即 start 复活）与 pagehide 兜底"人不在场→暂停"的哲学相反，
+   * 且复活的是无人看管的 8 agent × 常驻 CLI × bypassPermissions 自主工具执行。
+   * 现统一降级 paused + 落痕迹消息（重启后无 SSE 在场，落库才是用户可见的关键痕迹）；
+   * 恢复走 resume 全套（sdkSessionId 召回 + 水位补发），「继续」是显式授权 */
   recoverActiveMeetings(): void {
     const active = this.db.select().from(meetings)
       .where(eq(meetings.status, 'active')).all();
     for (const m of active) {
       try {
-        this.start(m.id);
+        this.setStatus(m.id, 'paused');
+        const trace = this.insertMessage({
+          meetingId: m.id, channel: 'chatroom', kind: 'system',
+          content: `检测到服务重启，会议已自动暂停。点「继续」召回，上下文与讨论增量将完整恢复。`,
+        });
+        this.emitMessage(trace);
       } catch (e) {
-        console.error(`[engine] 恢复会议 ${m.id} 失败:`, e);
+        console.error(`[engine] 隔离会议 ${m.id} 失败:`, e);
       }
     }
   }
 
   // ---------- 用户消息与私聊 ----------
+
+  /** 决议 5（陈终局注记）：SIGTERM 排水契约的引擎侧——优雅停止 = pause 全部 active。
+   *  close 后 consume 循环仍活着，排水窗口内迟到 result 经 onLateResult 落库；
+   *  窗口超时强杀时 onDiscard 痕迹（已随 pause 落）与 resume 对账补推兜底。
+   *  返回是否停了会议：调用方据此决定是否值得开排水窗口（空闲服务重启不该白等）。
+   *  排水窗口的有界性由调用方（engine-instance 的 SIGTERM 处理）保证——
+   *  maxTurns 40 的链子不能让「优雅」等成「挂起」（与否决 A 同一条理由） */
+  async gracefulShutdown(): Promise<boolean> {
+    const active = this.db.select().from(meetings)
+      .where(eq(meetings.status, 'active')).all();
+    for (const m of active) {
+      try {
+        await this.pause(m.id);
+      } catch (e) {
+        console.error(`[engine] 优雅停止会议 ${m.id} 失败:`, e);
+      }
+    }
+    return active.length > 0;
+  }
 
   sendUserMessage(meetingId: string, content: string): MessageRow {
     const m = this.getMeeting(meetingId);
@@ -527,6 +641,11 @@ ${this.roster(meetingId)}
           this.handleAgentResult(meetingId, p.id, text, 'dm');
           finish();
         },
+        // 决议 1（B+）一次性会话的接线：close 后的迟到 result 与常驻会话同款转交
+        //（dm 通道，红线不广播）；onDiscard 不落痕迹——离线回合已有超时/失败系统
+        // 消息兜底，再落 chatroom 痕迹反而把私聊存在感广播出去
+        onLateResult: (text) => this.handleLateResult(meetingId, p.id, text, 'dm'),
+        onDiscard: () => {},
         onRestart: () => {
           // 崩溃重建后原私信可能未进转录：重发一次（新队列已就绪，push 安全）
           session.push(buildDmPrompt(content), 'dm');
@@ -598,6 +717,9 @@ ${this.roster(meetingId)}
     emitMeetingEvent({ type: 'participant', meetingId, participant: this.participantInfo(row) });
 
     if (m.status === 'active') {
+      // 决议 3：join 消息广播给在线老成员（显式 except 新人——新人靠下方 catchUp
+      // 拿全量历史，含 join 行，不重复实时推送）。互补不是替代：入会自我介绍指令保留
+      this.broadcastChatroom(join, row.id);
       this.setAgentStatus(meetingId, row.id, 'thinking');
       this.createSessionFor(meetingId, row);
       this.catchUp(meetingId, row.id,
@@ -613,6 +735,16 @@ ${this.roster(meetingId)}
       .where(eq(participants.id, p.id)).run();
     const updated = this.getParticipant(meetingId, participantId);
     emitMeetingEvent({ type: 'participant', meetingId, participant: this.participantInfo(updated) });
+    // 决议 2：mute/unmute 落库 + 广播——system 事件不进推送流，在场者无从知悉成员
+    // 状态变化（实弹：禁言被误读为沉默）。禁言者本人被入口冻结自动跳过（水位不动，
+    // 解禁时 catchUp 补看）；解禁者显式 except——本人水位不因广播推进，catchUp 增量
+    // 得以按时间序覆盖"被禁言 → 冻结期间讨论 → 解除禁言"完整轨迹，不乱序不重复
+    const notice = this.insertMessage({
+      meetingId, channel: 'chatroom', kind: 'system',
+      content: `${p.displayName} ${muted ? '已被禁言' : '已被解除禁言'}。`,
+    });
+    this.emitMessage(notice);
+    this.broadcastChatroom(notice, muted ? undefined : participantId);
     // 解除禁言：补发冻结期间增量。指令必须显式说明此前被禁言——
     // 不给这句，agent 补完课容易一口气发长篇，等于解除禁言当场广播风暴
     if (!muted

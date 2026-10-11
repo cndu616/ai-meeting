@@ -1,5 +1,8 @@
 // tests/engine-control.test.ts —— 会议控制（pause/resume/end/崩溃/恢复）与动态成员
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { eq } from 'drizzle-orm';
 import { setupEngine, FakeSession } from './fake-session';
 import { MeetingEngine } from '@/core/engine';
@@ -116,6 +119,25 @@ describe('动态成员管理', () => {
     expect(p.lastInjectedMsgId).toBe(maxId);
   });
 
+  it('决议 3：join 系统消息广播给在线老成员；新人靠 catchUp 拿全量（不重复实时推送）', () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    sessions.forEach((s) => (s.pushes = []));
+
+    engine.addParticipant(m.id, {
+      templateId: 'architect', displayName: '王架构', goal: '全局视角把控',
+    });
+
+    // 老成员实时收到 join 广播（此前只 emitMessage 给 UI，agent 无感知——83 行盲区）
+    expect(sessions[0].pushes.some((p) => p.text.includes('王架构 加入会议'))).toBe(true);
+    expect(sessions[1].pushes.some((p) => p.text.includes('王架构 加入会议'))).toBe(true);
+    // 新成员：只收到一次 catchUp（入会指令 + 全量历史含 join 行），无重复实时推送
+    const newcomer = sessions[sessions.length - 1];
+    expect(newcomer.pushes.length).toBe(1);
+    expect(newcomer.pushes[0].text).toContain('中途加入');
+    expect(newcomer.pushes[0].text).toContain('王架构 加入会议');
+  });
+
   it('paused 会议添加成员：仅落库（resume 时统一重建）', () => {
     const { engine, m, sessions } = setupEngine();
     const before = sessions.length;
@@ -157,7 +179,7 @@ describe('动态成员管理', () => {
 });
 
 describe('服务器重启恢复', () => {
-  it('recoverActiveMeetings：重启 engine 后 active 会议自动重建会话；paused 不在范围', async () => {
+  it('决议 5：recoverActiveMeetings quarantine（不建会话）；恢复改走显式 resume（召回 + 补发）', async () => {
     const { db, engine, m, sessions } = setupEngine();
     engine.start(m.id);
     sessions[0].opts.callbacks.onSessionId('s-recover');
@@ -177,11 +199,19 @@ describe('服务器重启恢复', () => {
         return s;
       },
     });
+    // quarantine：active 孤儿降级 paused + 落痕迹消息，不创建任何会话（开机零 token）
     engine2.recoverActiveMeetings();
+    expect(created2.length).toBe(0);
+    expect(engine2.getMeeting(m.id).status).toBe('paused');
+    expect(engine2.getMessages(m.id)
+      .some((x) => x.kind === 'system' && x.content.includes('服务重启'))).toBe(true);
+    // 显式「继续」：resume 重建会话（sdkSessionId 召回 + 水位补发），痕迹消息也在增量里
+    await engine2.resume(m.id);
     expect(created2.length).toBe(2);
     expect(created2[0].opts.resumeSessionId).toBe('s-recover');
     expect(created2[0].pushes[0].text).toContain('重启前的消息');
-    // paused 会议不在恢复范围
+    expect(created2[0].pushes[0].text).toContain('服务重启');
+    // paused 会议不在 quarantine 范围：无会话、无痕迹、状态不变
     const pausedEnv = setupEngine();
     const created3: FakeSession[] = [];
     const engine3 = new MeetingEngine(pausedEnv.db, {
@@ -193,5 +223,90 @@ describe('服务器重启恢复', () => {
     });
     engine3.recoverActiveMeetings();
     expect(created3.length).toBe(0);
+    expect(engine3.getMeeting(pausedEnv.m.id).status).toBe('paused');
+    expect(engine3.getMessages(pausedEnv.m.id)
+      .some((x) => x.content.includes('服务重启'))).toBe(false);
+  });
+});
+
+// 决议 1（B+）engine 侧：close 痕迹消息 + 迟到 result 分通道转交。
+// FakeSession 不含 AgentSession 的内部时序，测试以手动触发 callbacks 模拟其时机
+describe('决议 1 B+：暂停丢弃的痕迹与迟到转交', () => {
+  it('onDiscard → 落痕迹系统消息（措辞不说死"丢弃"——迟到内容大概率会跟到）', () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    sessions[0].opts.callbacks.onDiscard();
+    const trace = engine.getMessages(m.id)
+      .find((x) => x.kind === 'system' && x.content.includes('在途'));
+    expect(trace).toBeTruthy();
+    expect(trace!.content).toContain('稍后送达');
+  });
+
+  it('onLateResult(chatroom) → 落迟到系统消息并广播给在场成员', () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    sessions.forEach((s) => (s.pushes = []));
+    sessions[0].opts.callbacks.onLateResult('暂停期间跑完的发言', 'chatroom');
+    const trace = engine.getMessages(m.id)
+      .find((x) => x.kind === 'system' && x.content.includes('暂停期间跑完的发言'));
+    expect(trace).toBeTruthy();
+    expect(trace!.channel).toBe('chatroom');
+    expect(sessions[1].pushes.some((p) => p.text.includes('暂停期间跑完的发言'))).toBe(true);
+    expect(sessions[0].pushes.length).toBe(0); // 不回推给发言者本人
+  });
+
+  it('红线：onLateResult(dm) 只落 dm channel、不广播（断言 channel 事实，不断言文案细节）', () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    sessions.forEach((s) => (s.pushes = []));
+    sessions[0].opts.callbacks.onLateResult('暂停期间跑完的私信回复', 'dm');
+    // 只进 dm channel
+    const dmMsgs = engine.getMessages(m.id).filter(
+      (x) => x.channel === 'dm' && x.content.includes('暂停期间跑完的私信回复'));
+    expect(dmMsgs.length).toBe(1);
+    // 红线：绝不落入 chatroom channel、绝不广播
+    const chatroomLeak = engine.getMessages(m.id).filter(
+      (x) => x.channel === 'chatroom' && x.content.includes('暂停期间跑完的私信回复'));
+    expect(chatroomLeak.length).toBe(0);
+    expect(sessions[1].pushes.some((p) => p.text.includes('暂停期间跑完的私信回复'))).toBe(false);
+  });
+
+  it('onLateResult 的 [SKIP] 与空文本不落任何消息', () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    const before = engine.getMessages(m.id).length;
+    sessions[0].opts.callbacks.onLateResult('[SKIP]', 'chatroom');
+    sessions[0].opts.callbacks.onLateResult('  ', 'dm');
+    expect(engine.getMessages(m.id).length).toBe(before);
+  });
+});
+
+// 决议 5（陈终局注记）：SIGTERM 排水契约——优雅停止 = pause 全部 active 会议。
+// close 后 consume 循环仍活着，排水窗口内迟到 result 经 onLateResult 落库；
+// 窗口超时强杀则 onDiscard 痕迹（已随 pause 落）+ resume 对账补推兜底。
+// 进程级 SIGTERM 注册是 engine-instance.ts 的胶水，此处测引擎侧可测核心
+describe('决议 5：gracefulShutdown（SIGTERM 排水契约的引擎侧）', () => {
+  it('active 会议全部 pause 并关闭会话；非 active 会议不动、无痕迹', async () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    // 另一场会议保持 paused（createMeeting 默认态）——不应被波及
+    const idle = engine.createMeeting({
+      title: 't2', topic: 'tp2',
+      workspacePath: fs.mkdtempSync(path.join(os.tmpdir(), 'ws-')),
+      participants: [
+        { templateId: 'dev', displayName: '王架构', goal: 'g' },
+        { templateId: 'test', displayName: '赵分析', goal: 'g' },
+      ],
+    });
+    const idleMsgCount = engine.getMessages(idle.id).length;
+
+    const hadActive = await engine.gracefulShutdown();
+
+    expect(hadActive).toBe(true); // 有 active 被停 → 调用方据此开排水窗口
+
+    expect(engine.getMeeting(m.id).status).toBe('paused');
+    expect(sessions.filter((s) => s.started).every((s) => s.closed)).toBe(true);
+    expect(engine.getMeeting(idle.id).status).toBe('paused'); // 原本就 paused，不变
+    expect(engine.getMessages(idle.id).length).toBe(idleMsgCount); // 无新消息、无痕迹
   });
 });

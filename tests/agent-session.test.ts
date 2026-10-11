@@ -46,6 +46,8 @@ function makeHarness(
     onResult: vi.fn(),
     onRestart: vi.fn(),
     onDead: vi.fn(),
+    onDiscard: vi.fn(),
+    onLateResult: vi.fn(),
     ...overrides,
   };
   const factory: QueryFactory = ({ prompt }) => {
@@ -137,6 +139,73 @@ describe('AgentSession', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(h.cbs.onResult).not.toHaveBeenCalled();
     expect(h.cbs.onTool).not.toHaveBeenCalled();
+  });
+
+  // 决议 1（B+）：close 后的迟到 result 不再静默吞——转录与会议记录分叉、
+  // 在线私信回复永不到达的病灶就在这个门卫。改为分通道转交 onLateResult。
+  describe('决议 1 B+：close 痕迹 + 迟到 result 转交', () => {
+    it('close 时有未销账 push（pendingSends 非空）→ onDiscard；已清空则不触发', async () => {
+      const h = makeHarness();
+      const s = makeSession(h.factory, h.cbs);
+      s.push('在途消息');
+      await vi.waitFor(() => expect(h.pushed.length).toBe(1));
+      await s.close(); // 未出 result：有在途回合 → 痕迹回调
+      expect(h.cbs.onDiscard).toHaveBeenCalledTimes(1);
+
+      const h2 = makeHarness();
+      const s2 = makeSession(h2.factory, h2.cbs);
+      s2.push('已回应的消息');
+      await vi.waitFor(() => expect(h2.pushed.length).toBe(1));
+      h2.streams[0].emit(okResult('回应了')); // 销账
+      await vi.waitFor(() => expect(h2.cbs.onResult).toHaveBeenCalled());
+      await s2.close(); // pendingSends 空 → 无痕迹
+      expect(h2.cbs.onDiscard).not.toHaveBeenCalled();
+    });
+
+    it('closed 后迟到 chatroom result → onLateResult(text, "chatroom")，onResult 仍不外泄；tool 仍静默', async () => {
+      const h = makeHarness();
+      const s = makeSession(h.factory, h.cbs);
+      s.push('聊天室消息');
+      await vi.waitFor(() => expect(h.pushed.length).toBe(1));
+      await s.close();
+      h.streams[0].emit(toolMsg('Read', { file_path: '/a.ts' }));
+      h.streams[0].emit(okResult('暂停后迟到的心声'));
+      await vi.waitFor(() => expect(h.cbs.onLateResult).toHaveBeenCalledWith('暂停后迟到的心声', 'chatroom'));
+      expect(h.cbs.onResult).not.toHaveBeenCalled();
+      expect(h.cbs.onTool).not.toHaveBeenCalled();
+    });
+
+    it('红线：closed 后迟到 dm result（uuid 回显）只走 dm 通道——绝不落入 chatroom', async () => {
+      const h = makeHarness();
+      const s = makeSession(h.factory, h.cbs);
+      s.push('私信内容', 'dm');
+      await vi.waitFor(() => expect(h.pushed.length).toBe(1));
+      const dmUuid = h.pushed[0].uuid!;
+      await s.close();
+      h.streams[0].emit({
+        type: 'result',
+        subtype: 'success',
+        result: '暂停期间跑完的私信回复',
+        user_message_uuids: [dmUuid],
+        session_id: 's-2',
+      } as unknown as SDKMessage);
+      await vi.waitFor(() =>
+        expect(h.cbs.onLateResult).toHaveBeenCalledWith('暂停期间跑完的私信回复', 'dm'));
+      // 通道判定的事实：绝无 chatroom 通道的迟到转交发生
+      expect(h.cbs.onLateResult).not.toHaveBeenCalledWith(expect.anything(), 'chatroom');
+      await s.close();
+    });
+
+    it('closed 后空文本 result 不转交（error turn 无内容可保）', async () => {
+      const h = makeHarness();
+      const s = makeSession(h.factory, h.cbs);
+      s.push('消息');
+      await vi.waitFor(() => expect(h.pushed.length).toBe(1));
+      await s.close();
+      h.streams[0].emit({ type: 'result', subtype: 'error_max_turns', session_id: 's-e' } as unknown as SDKMessage);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(h.cbs.onLateResult).not.toHaveBeenCalled();
+    });
   });
 
   it('流意外结束：自动重建一次并回调 onRestart；再次结束回调 onDead', async () => {

@@ -149,3 +149,51 @@ describe('私聊', () => {
     }
   });
 });
+
+// 决议 1（B+）第 3 点：resume/start 对账补推——某成员最后一条 dm 消息是 dm_user
+// （无 dm_agent/dm_system 回应）则重 push 补推；超时/失败/迟到类 dm system 算已回应。
+// 位置在 start 的 launch 闭包内、catchUp 之后（先补上下文再处理私信）
+describe('决议 1 B+：恢复对账补推无回应私信', () => {
+  it('最后一条 dm 是 dm_user（无回应）→ resume 重建后补推私信', async () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    const ps = engine.getParticipants(m.id);
+    // 用户私信、agent 未及回复（无任何回应）→ 暂停吞掉飞行回合 → resume
+    await engine.sendDm(m.id, ps[0].id, '没被回复的私信');
+    await engine.pause(m.id);
+    await engine.resume(m.id);
+
+    // 重建后的张工会话（start 按 speakOrder 重建：sessions[2]）
+    const fresh = sessions[2];
+    const dmPushes = fresh.pushes.filter((p) => p.kind === 'dm');
+    expect(dmPushes.length).toBe(1);
+    expect(dmPushes[0].text).toContain('没被回复的私信');
+    // 顺序：catchUp（chatroom 上下文）先于 dm 补推
+    const catchUpIdx = fresh.pushes.findIndex((p) => p.kind === 'chatroom');
+    const dmIdx = fresh.pushes.findIndex((p) => p.kind === 'dm');
+    expect(catchUpIdx).toBeGreaterThanOrEqual(0);
+    expect(catchUpIdx).toBeLessThan(dmIdx);
+  });
+
+  it('最后一条 dm 已有 dm_agent 回应 → 不补推', async () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    const ps = engine.getParticipants(m.id);
+    await engine.sendDm(m.id, ps[0].id, '已被回复的私信');
+    sessions[0].opts.callbacks.onResult('正常回复', 'dm');
+    await engine.pause(m.id);
+    await engine.resume(m.id);
+    expect(sessions[2].pushes.filter((p) => p.kind === 'dm').length).toBe(0);
+  });
+
+  it('最后一条 dm 是 dm system（超时/失败/迟到类交代）→ 算已回应，不补推', async () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    const ps = engine.getParticipants(m.id);
+    await engine.sendDm(m.id, ps[0].id, '得到交代的私信');
+    sessions[0].opts.callbacks.onLateResult('迟到的回复', 'dm'); // 落 dm system
+    await engine.pause(m.id);
+    await engine.resume(m.id);
+    expect(sessions[2].pushes.filter((p) => p.kind === 'dm').length).toBe(0);
+  });
+});
