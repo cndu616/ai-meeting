@@ -26,11 +26,20 @@ class ControlledStream implements AsyncIterable<SDKMessage> {
   }
 }
 
-function makeHarness(overrides?: Partial<AgentSessionCallbacks>) {
+function makeHarness(
+  overrides?: Partial<AgentSessionCallbacks>,
+  opts?: { noAutoConsume?: number[] },
+) {
   const pushed: SDKUserMessage[] = [];
   /** 每个 query 独立记录各自的 prompt 消费（按流创建顺序） */
   const pushedByStream: SDKUserMessage[][] = [];
   const streams: ControlledStream[] = [];
+  /**
+   * 受控开关：noAutoConsume 列出的流（按创建序号）不自动启动 prompt 消费循环，
+   * 消息滞留在 PushQueue 缓冲里（模拟 CLI 崩溃前一直没读走）；
+   * 需要时可从 manualConsumers 手动启动消费。
+   */
+  const manualConsumers = new Map<number, () => Promise<void>>();
   const cbs = {
     onSessionId: vi.fn(),
     onTool: vi.fn(),
@@ -41,18 +50,21 @@ function makeHarness(overrides?: Partial<AgentSessionCallbacks>) {
   };
   const factory: QueryFactory = ({ prompt }) => {
     const stream = new ControlledStream();
+    const index = streams.length;
     streams.push(stream);
     const mine: SDKUserMessage[] = [];
     pushedByStream.push(mine);
-    void (async () => {
+    const consume = async () => {
       for await (const m of prompt) {
         pushed.push(m);
         mine.push(m);
       }
-    })();
+    };
+    if (opts?.noAutoConsume?.includes(index)) manualConsumers.set(index, consume);
+    else void consume();
     return stream;
   };
-  return { pushed, pushedByStream, streams, cbs, factory };
+  return { pushed, pushedByStream, streams, manualConsumers, cbs, factory };
 }
 
 const initMsg = { type: 'system', subtype: 'init', session_id: 's-1' } as SDKMessage;
@@ -192,8 +204,24 @@ describe('AgentSession', () => {
     await vi.waitFor(() => expect(h.pushedByStream[0]?.length).toBe(1));
     const dmUuid = h.pushedByStream[0][0].uuid!;
 
-    h.streams[0].end(); // 崩溃重建（绑定应被清空）
+    h.streams[0].end(); // 崩溃重建：未销账的私信会被重发（新 uuid、重新绑定）
     await vi.waitFor(() => expect(h.streams.length).toBe(2));
+    await vi.waitFor(() => expect(h.pushedByStream[1]?.length).toBe(1));
+    const replayUuid = h.pushedByStream[1][0].uuid!;
+    expect(replayUuid).not.toBe(dmUuid); // 重放必须换新 uuid，不能沿用已清空的旧绑定
+
+    // 重放后的私信正常出 result：按新 uuid 销账、走 dm 通道
+    h.streams[1].emit({
+      type: 'result',
+      subtype: 'success',
+      result: '私信回复',
+      user_message_uuids: [replayUuid],
+      session_id: 's-4',
+    } as unknown as SDKMessage);
+    await vi.waitFor(() => expect(h.cbs.onResult).toHaveBeenCalledWith('私信回复', 'dm'));
+
+    // 旧 uuid 再被回显（崩溃前的幽灵回显）：绑定表里已无此 uuid、也无其他残留绑定，
+    // 公开回复不会被误判为 dm
     h.streams[1].emit({
       type: 'result',
       subtype: 'success',
@@ -251,6 +279,82 @@ describe('AgentSession', () => {
     } as unknown as SDKMessage);
     await vi.waitFor(() => expect(h.cbs.onResult).toHaveBeenCalledTimes(2));
     expect(h.cbs.onResult).toHaveBeenLastCalledWith('后续回复', 'chatroom');
+    await s.close();
+  });
+
+  it('崩溃时未读缓冲迁移：旧队列里未被读走的消息按序重放进新流', async () => {
+    // 流1 的 prompt 无人消费：push 只落进 PushQueue 缓冲（CLI 未读走），
+    // 复现「push 即推进水位线、但 CLI 还没读」的崩溃窗口
+    const h = makeHarness(undefined, { noAutoConsume: [0] });
+    const s = makeSession(h.factory, h.cbs);
+    s.push('聊天室消息', 'chatroom');
+    s.push('私信内容', 'dm');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.pushed.length).toBe(0); // 确认两条都未被读走
+
+    h.streams[0].end(); // 崩溃：start() 换新队列，未读消息不能就此丢失
+    await vi.waitFor(() => expect(h.cbs.onRestart).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(h.pushedByStream[1]?.length).toBe(2));
+    expect(h.pushedByStream[1][0].message.content).toBe('聊天室消息'); // 保序
+    expect(h.pushedByStream[1][1].message.content).toBe('私信内容');
+    await s.close();
+  });
+
+  it('崩溃时已被读走但未销账的 dm 会重发到新流', async () => {
+    const h = makeHarness();
+    const s = makeSession(h.factory, h.cbs);
+    s.push('私信内容', 'dm');
+    await vi.waitFor(() => expect(h.pushedByStream[0]?.length).toBe(1)); // CLI 已读走
+
+    h.streams[0].end(); // 还没出 result 就崩溃：不重发的话，重建后的回复会走聊天室通道泄漏
+    await vi.waitFor(() => expect(h.cbs.onRestart).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(h.pushedByStream[1]?.length).toBe(1));
+    expect(h.pushedByStream[1][0].message.content).toBe('私信内容');
+    await s.close();
+  });
+
+  it('已销账（出过 result）的 dm 崩溃后不重发', async () => {
+    const h = makeHarness();
+    const s = makeSession(h.factory, h.cbs);
+    s.push('私信内容', 'dm');
+    await vi.waitFor(() => expect(h.pushedByStream[0]?.length).toBe(1));
+    const dmUuid = h.pushedByStream[0][0].uuid!;
+    h.streams[0].emit({
+      type: 'result',
+      subtype: 'success',
+      result: '私信回复',
+      user_message_uuids: [dmUuid],
+      session_id: 's-2',
+    } as unknown as SDKMessage);
+    await vi.waitFor(() => expect(h.cbs.onResult).toHaveBeenCalledWith('私信回复', 'dm'));
+
+    h.streams[0].end(); // 崩溃重建：已处理完的私信不该再来一遍
+    await vi.waitFor(() => expect(h.cbs.onRestart).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(h.pushedByStream[1]?.length ?? 0).toBe(0); // 新流没有收到重发
+    await s.close();
+  });
+
+  it('未读 dm 重放后通道重新绑定：回复按 dm 归还而非广播（防泄漏回归）', async () => {
+    const h = makeHarness(undefined, { noAutoConsume: [0] });
+    const s = makeSession(h.factory, h.cbs);
+    s.push('机密私信', 'dm');
+    h.streams[0].end(); // 未读即崩溃 → 重放进新流
+
+    await vi.waitFor(() => expect(h.cbs.onRestart).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(h.pushedByStream[1]?.length).toBe(1));
+    expect(h.pushedByStream[1][0].message.content).toBe('机密私信');
+    // 关键：重放必须换新 uuid 重新绑定——旧 uuid 已随绑定表清空，
+    // 若原样入队，result 回显旧 uuid 会走插入序回退判成 chatroom，私信回复就广播了
+    const replayUuid = h.pushedByStream[1][0].uuid!;
+    h.streams[1].emit({
+      type: 'result',
+      subtype: 'success',
+      result: '私信的回复',
+      user_message_uuids: [replayUuid],
+      session_id: 's-2',
+    } as unknown as SDKMessage);
+    await vi.waitFor(() => expect(h.cbs.onResult).toHaveBeenCalledWith('私信的回复', 'dm'));
     await s.close();
   });
 });
