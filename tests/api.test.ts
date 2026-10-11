@@ -4,6 +4,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+// SSE 路由的 connection() 是 Next 运行时 API，脱离请求作用域（直调 handler）会抛——测试环境置空
+vi.mock('next/server', async () => {
+  const actual = await vi.importActual<typeof import('next/server')>('next/server');
+  return { ...actual, connection: async () => {} };
+});
+
 vi.mock('@/db/client', async () => {
   const actual = await vi.importActual<typeof import('@/db/client')>('@/db/client');
   const db = actual.createTestDb();
@@ -33,6 +39,7 @@ import { POST as sendMessage } from '@/app/api/meetings/[id]/messages/route';
 import { POST as addParticipant } from '@/app/api/meetings/[id]/participants/route';
 import { PATCH as patchParticipant } from '@/app/api/meetings/[id]/participants/[participantId]/route';
 import { POST as sendDm } from '@/app/api/meetings/[id]/dm/route';
+import { GET as eventsRoute } from '@/app/api/meetings/[id]/events/route';
 
 const ws = () => fs.mkdtempSync(path.join(os.tmpdir(), 'ws-'));
 
@@ -143,4 +150,101 @@ describe('api', () => {
       expect((await res.json()).error).toMatch(/未知操作/);
     }
   });
+
+  it('SSE 重连带 Last-Event-ID：补发缺失区间的 message（帧带 id: 行），不重发已收', async () => {
+    const created = await (await createMeeting(new NextRequest('http://x/api/meetings', {
+      method: 'POST', body: JSON.stringify(body()),
+    }))).json();
+    await sendMessage(new NextRequest(`http://x/api/meetings/${created.id}/messages`, {
+      method: 'POST', body: JSON.stringify({ content: '断线前的消息' }),
+    }) as Parameters<typeof sendMessage>[0], { params: Promise.resolve({ id: created.id }) });
+    await sendMessage(new NextRequest(`http://x/api/meetings/${created.id}/messages`, {
+      method: 'POST', body: JSON.stringify({ content: '断线窗口丢失的消息' }),
+    }) as Parameters<typeof sendMessage>[0], { params: Promise.resolve({ id: created.id }) });
+
+    const engine = (await import('@/core/engine-instance')).getEngine();
+    const msgs = engine.getMessages(created.id); // [开场 system, 用户1, 用户2]
+    const lastEventId = msgs[1].id; // 客户端已收到开场+第一条，断线
+
+    const res = await eventsRoute(
+      new NextRequest(`http://x/api/meetings/${created.id}/events`, {
+        headers: { 'last-event-id': String(lastEventId) },
+      }) as Parameters<typeof eventsRoute>[0],
+      { params: Promise.resolve({ id: created.id }) },
+    );
+    const frames = await readSseFrames(res);
+    const messageFrames = frames.filter((f) => (f.data as { type?: string })?.type === 'message');
+    // 只补发缺失区间：用户2，不重发开场与用户1
+    expect(messageFrames.map((f) => (f.data as { message: { id: number } }).message.id))
+      .toEqual([msgs[2].id]);
+    // message 帧必须带 id: 行（重连的 Last-Event-ID 锚点）
+    expect(messageFrames[0].id).toBe(String(msgs[2].id));
+  });
+
+  it('SSE 重连：participant/meeting_status 快照重发，agent_status 瞬态不补', async () => {
+    const created = await (await createMeeting(new NextRequest('http://x/api/meetings', {
+      method: 'POST', body: JSON.stringify(body()),
+    }))).json();
+    const engine = (await import('@/core/engine-instance')).getEngine();
+    await addParticipant(new NextRequest(`http://x/api/meetings/${created.id}/participants`, {
+      method: 'POST',
+      body: JSON.stringify({ templateId: 'analyst', displayName: '王分析', goal: '补充视角' }),
+    }) as Parameters<typeof addParticipant>[0], { params: Promise.resolve({ id: created.id }) });
+    await action(new NextRequest(`http://x/api/meetings/${created.id}/pause`, {
+      method: 'POST',
+    }) as Parameters<typeof action>[0], { params: Promise.resolve({ id: created.id, action: 'pause' }) });
+
+    const lastEventId = engine.getMessages(created.id)[0].id; // 收到过开场后断线
+    const res = await eventsRoute(
+      new NextRequest(`http://x/api/meetings/${created.id}/events`, {
+        headers: { 'last-event-id': String(lastEventId) },
+      }) as Parameters<typeof eventsRoute>[0],
+      { params: Promise.resolve({ id: created.id }) },
+    );
+    const frames = await readSseFrames(res);
+    const types = frames.map((f) => (f.data as { type: string }).type);
+    // 快照重发：全部 3 个成员（含断线期间加入的）+ 当前会议状态
+    expect(types.filter((t) => t === 'participant').length).toBe(3);
+    const statusFrame = frames.find((f) => (f.data as { type: string }).type === 'meeting_status');
+    expect((statusFrame!.data as { status: string }).status).toBe('paused');
+    // 瞬态事件不补
+    expect(types).not.toContain('agent_status');
+    // 快照帧不带 id: 行（Last-Event-ID 锚点只挂 message）
+    for (const f of frames) {
+      if ((f.data as { type: string }).type !== 'message') expect(f.id).toBeUndefined();
+    }
+  });
 });
+
+/** 读取 SSE 流中已缓冲的帧：补发在连接建立时同步入队，但每帧是独立 chunk——
+ *  循环读到缓冲耗尽（短超时无新帧即停），不能只读一次（多帧分多 chunk 到达） */
+async function readSseFrames(res: Response): Promise<{ id?: string; data: unknown }[]> {
+  {
+    const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+    const chunks: Uint8Array[] = [];
+    for (;;) {
+      // 补发帧首帧到达时已全部在队列：后续 read 立即 resolve；队列耗尽后挂起，
+      // 以 50ms 超时判定"缓冲已尽"退出（无 fake timers，真实短超时）
+      const next = await Promise.race([
+        reader.read(),
+        new Promise<undefined>((r) => setTimeout(() => r(undefined), 50)),
+      ]);
+      if (!next || next.done) break;
+      chunks.push(next.value);
+    }
+    await reader.cancel().catch(() => {});
+    const text = chunks.map((c) => new TextDecoder().decode(c)).join('');
+    const frames: { id?: string; data: unknown }[] = [];
+    for (const block of text.split('\n\n')) {
+      if (!block || block.startsWith(':')) continue; // 心跳注释行
+      let id: string | undefined;
+      let data = '';
+      for (const line of block.split('\n')) {
+        if (line.startsWith('id: ')) id = line.slice(4);
+        else if (line.startsWith('data: ')) data = line.slice(6);
+      }
+      if (data) frames.push({ id, data: JSON.parse(data) });
+    }
+    return frames;
+  }
+}

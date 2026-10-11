@@ -1,5 +1,9 @@
 import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core';
 
+// 防线结构说明（契约纪律）：枚举列的 text({ enum }) 只是 drizzle 的**编译期类型收窄**，
+// SQLite 运行时仍是自由 text、无 CHECK 约束——运行时防线在消费端 zod safeParse
+// （src/lib/events.ts）。三层防线：TS 编译期（本文件）→ zod 运行时（events.ts）→ 无 DB 层约束。
+
 /** agent 模板：岗位画像（无名字，名字在会议实例上） */
 export const agents = sqliteTable('agents', {
   id: text('id').primaryKey(), // slug，如 'dev'
@@ -14,7 +18,7 @@ export const meetings = sqliteTable('meetings', {
   title: text('title').notNull(),
   topic: text('topic').notNull(),
   workspacePath: text('workspace_path').notNull(),
-  status: text('status').notNull().default('paused'), // active | paused | ended
+  status: text('status', { enum: ['active', 'paused', 'ended'] }).notNull().default('paused'),
   createdAt: integer('created_at').notNull(),
   endedAt: integer('ended_at'),
 });
@@ -35,9 +39,9 @@ export const participants = sqliteTable('participants', {
 export const messages = sqliteTable('messages', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   meetingId: text('meeting_id').notNull(),
-  channel: text('channel').notNull(), // chatroom | dm
+  channel: text('channel', { enum: ['chatroom', 'dm'] }).notNull(),
   participantId: text('participant_id'), // speech/dm_agent=发言者实例；dm=私聊目标实例；user/system=null
-  kind: text('kind').notNull(), // speech | user | system | dm_user | dm_agent
+  kind: text('kind', { enum: ['speech', 'user', 'system', 'dm_user', 'dm_agent'] }).notNull(),
   content: text('content').notNull(),
   createdAt: integer('created_at').notNull(),
 });
