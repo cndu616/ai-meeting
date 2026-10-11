@@ -7,7 +7,7 @@ import ChatPanel from './ChatPanel';
 import DmDrawer from './DmDrawer';
 import AddMemberDialog from './AddMemberDialog';
 import type { RoomData, AgentStatus } from './types';
-import type { MeetingEvent } from '@/lib/events';
+import { parseMeetingEvent } from '@/lib/eventParsing';
 import { shouldPauseOnPageHide, pauseBeaconUrl, shouldResyncOnPageShow } from './pageHidePause';
 import { mergeMessage } from './chatMessages';
 import { canToggleMute } from './meetingControls';
@@ -21,10 +21,19 @@ export default function Room({ initial }: { initial: RoomData }) {
   const [states, setStates] = useState<Record<string, { status: AgentStatus; detail?: string }>>({});
   const [dmTarget, setDmTarget] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
+  const [sseWarn, setSseWarn] = useState<{ count: number; lastReason: string } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const applyEvent = useCallback((e: MessageEvent) => {
-    const data = JSON.parse(e.data) as MeetingEvent;
+    const parsed = parseMeetingEvent(e.data);
+    if (!parsed.ok) {
+      // 畸形事件隔离：一条坏事件只污染自己，不中断后续事件处理。
+      // 降级提示为纯客户端本地状态（不落库不广播，刷新即清）——正常态永不出现，
+      // 出现即契约漂移信号（服务端/客户端版本错配），黄条文案带动作指引。
+      setSseWarn((w) => ({ count: (w?.count ?? 0) + 1, lastReason: parsed.reason }));
+      return;
+    }
+    const data = parsed.event;
     switch (data.type) {
       case 'message':
         // 去重 + 有序合并：为 SSE 断线补发（旧区间后到）做准备，见 chatMessages.ts
@@ -167,13 +176,21 @@ export default function Room({ initial }: { initial: RoomData }) {
         </div>
       </aside>
 
-      <ChatPanel
-        messages={messages.filter((m) => m.channel === 'chatroom')}
-        participants={participants}
-        onSend={sendChat}
-        disabled={meeting.status === 'ended'}
-        bottomRef={bottomRef}
-      />
+      <div className="flex min-w-0 flex-1 flex-col">
+        {sseWarn && (
+          <div className="shrink-0 border-b border-yellow-300 bg-yellow-50 px-4 py-1.5 text-xs text-yellow-800">
+            ⚠ 收到 {sseWarn.count} 条无法解析的事件（最近：{sseWarn.lastReason}）。
+            请刷新页面；若刷新后仍出现请反馈。其余消息不受影响。
+          </div>
+        )}
+        <ChatPanel
+          messages={messages.filter((m) => m.channel === 'chatroom')}
+          participants={participants}
+          onSend={sendChat}
+          disabled={meeting.status === 'ended'}
+          bottomRef={bottomRef}
+        />
+      </div>
 
       {dmParty && (
         <DmDrawer
