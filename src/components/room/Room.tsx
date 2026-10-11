@@ -8,6 +8,8 @@ import DmDrawer from './DmDrawer';
 import AddMemberDialog from './AddMemberDialog';
 import type { RoomData, AgentStatus } from './types';
 import type { MeetingEvent } from '@/lib/events';
+import { shouldPauseOnPageHide, pauseBeaconUrl, shouldResyncOnPageShow } from './pageHidePause';
+import { mergeMessage } from './chatMessages';
 
 export type { ParticipantView, RoomData } from './types';
 
@@ -24,9 +26,8 @@ export default function Room({ initial }: { initial: RoomData }) {
     const data = JSON.parse(e.data) as MeetingEvent;
     switch (data.type) {
       case 'message':
-        setMessages((ms) =>
-          ms.some((m) => m.id === data.message.id) ? ms : [...ms, data.message],
-        );
+        // 去重 + 有序合并：为 SSE 断线补发（旧区间后到）做准备，见 chatMessages.ts
+        setMessages((ms) => mergeMessage(ms, data.message));
         break;
       case 'agent_status':
         setStates((s) => ({
@@ -59,6 +60,34 @@ export default function Room({ initial }: { initial: RoomData }) {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages.length]);
+
+  // 离开页面兜底暂停：active 状态下关页/刷新时用 sendBeacon 打 pause，
+  // 防止无人观看的会议在服务端重启后被 recoverActiveMeetings 复活空烧 token。
+  // 注意：pagehide 在 bfcache（往返缓存）场景同样触发——用户"后退"回来时页面不重载，
+  // 但会议已暂停，需要手动点"开始/继续"。这是刻意取舍：宁停勿烧，不是 bug。
+  useEffect(() => {
+    const onPageHide = () => {
+      if (!shouldPauseOnPageHide(meeting.status)) return;
+      navigator.sendBeacon(pauseBeaconUrl(meeting.id), '');
+    };
+    // bfcache 还原对齐：pagehide 时 beacon 已把服务端置 paused，但本地 state 冻结在 active，
+    // 断线期间的 meeting_status 事件也收不回——persisted 还原时重拉一次会议状态收口。
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (!shouldResyncOnPageShow(e.persisted)) return;
+      fetch(`/api/meetings/${meeting.id}`)
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data: { meeting?: typeof meeting } | null) => {
+          if (data?.meeting) setMeeting((m) => ({ ...m, ...data.meeting }));
+        })
+        .catch(() => {});
+    };
+    window.addEventListener('pagehide', onPageHide);
+    window.addEventListener('pageshow', onPageShow);
+    return () => {
+      window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('pageshow', onPageShow);
+    };
+  }, [meeting.id, meeting.status]);
 
   const act = async (action: string) => {
     const res = await fetch(`/api/meetings/${meeting.id}/${action}`, { method: 'POST' });
@@ -115,11 +144,6 @@ export default function Room({ initial }: { initial: RoomData }) {
           {meeting.status === 'active' && (
             <button onClick={() => act('pause')} className="rounded bg-yellow-600 px-3 py-1 text-xs text-white">
               暂停
-            </button>
-          )}
-          {meeting.status !== 'ended' && (
-            <button onClick={() => act('end')} className="rounded bg-red-600 px-3 py-1 text-xs text-white">
-              结束
             </button>
           )}
           {meeting.status !== 'ended' && (

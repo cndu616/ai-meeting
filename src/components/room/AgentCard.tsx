@@ -45,7 +45,9 @@ export default function AgentCard({
       </div>
       <p className="mt-1 text-[11px] text-gray-600">{participant.goal}</p>
       {participant.muted && (
-        <p className="mt-1 text-[11px] text-red-500">已被主持人禁言</p>
+        <p className="mt-1 text-[11px] text-red-500">
+          已被主持人禁言（不接收新消息，发言冻结；私聊不受影响）
+        </p>
       )}
       {(busy || state.status === 'offline') && (
         <p className={`mt-1 animate-pulse text-[11px] ${state.status === 'offline' ? 'text-red-500' : 'text-blue-600'}`}>
