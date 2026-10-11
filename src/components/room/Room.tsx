@@ -1,33 +1,53 @@
+// src/components/room/Room.tsx
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import AgentCard from './AgentCard';
 import ChatPanel from './ChatPanel';
 import DmDrawer from './DmDrawer';
-import type { ParticipantView, RoomData, AgentState } from './types';
+import AddMemberDialog from './AddMemberDialog';
+import type { RoomData, AgentStatus } from './types';
+import type { MeetingEvent } from '@/lib/events';
+import { shouldPauseOnPageHide, pauseBeaconUrl, shouldResyncOnPageShow } from './pageHidePause';
+import { mergeMessage } from './chatMessages';
 
 export type { ParticipantView, RoomData } from './types';
 
 export default function Room({ initial }: { initial: RoomData }) {
   const [meeting, setMeeting] = useState(initial.meeting);
+  const [participants, setParticipants] = useState(initial.participants);
   const [messages, setMessages] = useState(initial.messages);
-  const [states, setStates] = useState<Record<string, { status: AgentState; detail?: string }>>({});
+  const [states, setStates] = useState<Record<string, { status: AgentStatus; detail?: string }>>({});
   const [dmTarget, setDmTarget] = useState<string | null>(null);
+  const [showAdd, setShowAdd] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const applyEvent = useCallback((e: MessageEvent) => {
-    const data = JSON.parse(e.data);
-    if (data.type === 'message') {
-      setMessages((ms) =>
-        ms.some((m) => m.id === data.message.id) ? ms : [...ms, data.message],
-      );
-    } else if (data.type === 'agent_status') {
-      setStates((s) => ({
-        ...s,
-        [data.agentId]: { status: data.status, detail: data.detail },
-      }));
-    } else if (data.type === 'meeting_status') {
-      setMeeting((m) => ({ ...m, status: data.status }));
+    const data = JSON.parse(e.data) as MeetingEvent;
+    switch (data.type) {
+      case 'message':
+        // 去重 + 有序合并：为 SSE 断线补发（旧区间后到）做准备，见 chatMessages.ts
+        setMessages((ms) => mergeMessage(ms, data.message));
+        break;
+      case 'agent_status':
+        setStates((s) => ({
+          ...s,
+          [data.participantId]: { status: data.status, detail: data.detail },
+        }));
+        break;
+      case 'participant': {
+        const info = data.participant;
+        setParticipants((ps) => {
+          const exists = ps.some((p) => p.id === info.id);
+          return exists
+            ? ps.map((p) => (p.id === info.id ? { ...p, ...info } : p))
+            : [...ps, info];
+        });
+        break;
+      }
+      case 'meeting_status':
+        setMeeting((m) => ({ ...m, status: data.status }));
+        break;
     }
   }, []);
 
@@ -41,23 +61,53 @@ export default function Room({ initial }: { initial: RoomData }) {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages.length]);
 
-  const refreshMeeting = async () => {
-    const res = await fetch(`/api/meetings/${meeting.id}`);
-    const d = await res.json();
-    if (d.meeting) setMeeting(d.meeting);
+  // 离开页面兜底暂停：active 状态下关页/刷新时用 sendBeacon 打 pause，
+  // 防止无人观看的会议在服务端重启后被 recoverActiveMeetings 复活空烧 token。
+  // 注意：pagehide 在 bfcache（往返缓存）场景同样触发——用户"后退"回来时页面不重载，
+  // 但会议已暂停，需要手动点"开始/继续"。这是刻意取舍：宁停勿烧，不是 bug。
+  useEffect(() => {
+    const onPageHide = () => {
+      if (!shouldPauseOnPageHide(meeting.status)) return;
+      navigator.sendBeacon(pauseBeaconUrl(meeting.id), '');
+    };
+    // bfcache 还原对齐：pagehide 时 beacon 已把服务端置 paused，但本地 state 冻结在 active，
+    // 断线期间的 meeting_status 事件也收不回——persisted 还原时重拉一次会议状态收口。
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (!shouldResyncOnPageShow(e.persisted)) return;
+      fetch(`/api/meetings/${meeting.id}`)
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data: { meeting?: typeof meeting } | null) => {
+          if (data?.meeting) setMeeting((m) => ({ ...m, ...data.meeting }));
+        })
+        .catch(() => {});
+    };
+    window.addEventListener('pagehide', onPageHide);
+    window.addEventListener('pageshow', onPageShow);
+    return () => {
+      window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('pageshow', onPageShow);
+    };
+  }, [meeting.id, meeting.status]);
+
+  const act = async (action: string) => {
+    const res = await fetch(`/api/meetings/${meeting.id}/${action}`, { method: 'POST' });
+    if (res.ok && action === 'pause') setMeeting((m) => ({ ...m, status: 'paused' }));
+    if (res.ok && (action === 'start' || action === 'resume')) {
+      setMeeting((m) => ({ ...m, status: 'active' }));
+    }
+    if (res.ok && action === 'end') setMeeting((m) => ({ ...m, status: 'ended' }));
   };
 
-  const act = async (action: string, body?: object) => {
-    await fetch(`/api/meetings/${meeting.id}/${action}`, {
-      method: 'POST',
+  const toggleMute = async (participantId: string, muted: boolean) => {
+    const res = await fetch(`/api/meetings/${meeting.id}/participants/${participantId}`, {
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : undefined,
+      body: JSON.stringify({ muted }),
     });
-    if (action === 'start' || action === 'resume') {
-      setMeeting((m) => ({ ...m, status: 'active' }));
-    } else {
-      await refreshMeeting();
-    }
+    if (!res.ok) return;
+    setParticipants((ps) =>
+      ps.map((p) => (p.id === participantId ? { ...p, muted } : p)),
+    );
   };
 
   const sendChat = async (content: string) => {
@@ -68,27 +118,26 @@ export default function Room({ initial }: { initial: RoomData }) {
     });
   };
 
-  const sendDm = async (agentId: string, content: string) => {
+  const sendDm = async (participantId: string, content: string) => {
     await fetch(`/api/meetings/${meeting.id}/dm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId, content }),
+      body: JSON.stringify({ participantId, content }),
     });
   };
 
-  const dmAgent = initial.participants.find((p) => p.agentId === dmTarget);
+  const dmParty = participants.find((p) => p.id === dmTarget);
 
   return (
     <div className="flex h-screen">
       <aside className="w-72 shrink-0 overflow-y-auto border-r p-4">
         <h1 className="font-bold">{meeting.title}</h1>
         <p className="mt-1 text-xs text-gray-500">{meeting.topic}</p>
-        <p className="mt-2 text-xs">
-          状态：{meeting.status} · 轮次 {meeting.currentRound}/{meeting.maxRounds}
-        </p>
+        <p className="mt-2 text-xs">状态：{meeting.status}</p>
         <div className="mt-3 flex flex-wrap gap-2">
           {meeting.status === 'paused' && (
-            <button onClick={() => act('start')} className="rounded bg-green-600 px-3 py-1 text-xs text-white">
+            <button onClick={() => act('start')}
+              className="rounded bg-green-600 px-3 py-1 text-xs text-white">
               开始/继续
             </button>
           )}
@@ -98,23 +147,20 @@ export default function Room({ initial }: { initial: RoomData }) {
             </button>
           )}
           {meeting.status !== 'ended' && (
-            <button onClick={() => act('end')} className="rounded bg-red-600 px-3 py-1 text-xs text-white">
-              结束
-            </button>
-          )}
-          {meeting.status === 'paused' && (
-            <button onClick={() => act('extend', { rounds: 3 })} className="rounded bg-gray-600 px-3 py-1 text-xs text-white">
-              +3 轮
+            <button onClick={() => setShowAdd(true)} className="rounded bg-gray-600 px-3 py-1 text-xs text-white">
+              + 添加成员
             </button>
           )}
         </div>
         <div className="mt-4 space-y-2">
-          {initial.participants.map((p) => (
+          {participants.map((p) => (
             <AgentCard
-              key={p.agentId}
+              key={p.id}
               participant={p}
-              state={states[p.agentId] ?? { status: 'idle' }}
-              onDm={() => setDmTarget(p.agentId)}
+              state={states[p.id] ?? { status: 'idle' }}
+              meetingActive={meeting.status === 'active'}
+              onDm={() => setDmTarget(p.id)}
+              onToggleMute={() => toggleMute(p.id, !p.muted)}
             />
           ))}
         </div>
@@ -122,20 +168,24 @@ export default function Room({ initial }: { initial: RoomData }) {
 
       <ChatPanel
         messages={messages.filter((m) => m.channel === 'chatroom')}
-        participants={initial.participants}
+        participants={participants}
         onSend={sendChat}
         disabled={meeting.status === 'ended'}
         bottomRef={bottomRef}
       />
 
-      {dmAgent && (
+      {dmParty && (
         <DmDrawer
-          participant={dmAgent}
-          messages={messages.filter((m) => m.channel === 'dm' && m.agentId === dmAgent.agentId)}
-          onSend={(c) => sendDm(dmAgent.agentId, c)}
+          participant={dmParty}
+          messages={messages.filter((m) => m.channel === 'dm' && m.participantId === dmParty.id)}
+          onSend={(c) => sendDm(dmParty.id, c)}
           onClose={() => setDmTarget(null)}
           disabled={meeting.status === 'ended'}
         />
+      )}
+
+      {showAdd && (
+        <AddMemberDialog meetingId={meeting.id} onClose={() => setShowAdd(false)} />
       )}
     </div>
   );

@@ -33,7 +33,7 @@ export default function DmDrawer({
     <aside className="flex w-80 shrink-0 flex-col border-l">
       <div className="flex items-center justify-between border-b p-3">
         <span className="text-sm font-medium">
-          {participant.agent.avatar} 与 {participant.agent.name} 私聊
+          {participant.avatar} 与 {participant.displayName} 私聊
         </span>
         <button onClick={onClose} className="text-xs text-gray-500 hover:text-gray-800">关闭</button>
       </div>

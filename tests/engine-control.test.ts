@@ -1,93 +1,197 @@
-import { describe, it, expect, vi } from 'vitest';
+// tests/engine-control.test.ts —— 会议控制（pause/resume/end/崩溃/恢复）与动态成员
+import { describe, it, expect } from 'vitest';
 import { eq } from 'drizzle-orm';
-import { createTestDb } from '@/db/client';
-import { importAgentsToDb, loadAgentFiles } from '@/core/agent-config';
-import { MeetingEngine, type CreateMeetingInput } from '@/core/engine';
-import { meetings, messages } from '@/db/schema';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-
-function setup(maxRounds = 4) {
-  const db = createTestDb();
-  importAgentsToDb(db, loadAgentFiles());
-  const input: CreateMeetingInput = {
-    title: 't', topic: 'tp',
-    workspacePath: fs.mkdtempSync(path.join(os.tmpdir(), 'ws-')),
-    maxRounds,
-    participants: [
-      { agentId: 'dev', meetingRole: '激进派' },
-      { agentId: 'test', meetingRole: '保守派' },
-    ],
-  };
-  let n = 0;
-  const runner = vi.fn(async (_input: { resumeSessionId?: string }) => ({
-    speech: `第${++n}条发言`, sessionId: `s-${n}`, toolActivities: [] as { tool: string; detail: string }[],
-  }));
-  const engine = new MeetingEngine(db, runner as never);
-  const m = engine.createMeeting(input);
-  return { db, engine, runner, meetingId: m.id };
-}
-
-/** 在第 n 次调用时阻塞，返回释放函数（用于精确控制暂停时机） */
-function gateAt(runner: ReturnType<typeof vi.fn>, n: number) {
-  let release!: () => void;
-  const gate = new Promise<void>((r) => (release = r));
-  const impl = runner.getMockImplementation()!;
-  runner.mockImplementation(async (...args: unknown[]) => {
-    const count = runner.mock.calls.length;
-    if (count === n) await gate;
-    return (impl as (...a: unknown[]) => Promise<unknown>)(...args);
-  });
-  return release;
-}
-
-const speechCount = (db: ReturnType<typeof createTestDb>) =>
-  db.select().from(messages).where(eq(messages.kind, 'speech')).all().length;
+import { setupEngine, FakeSession } from './fake-session';
+import { MeetingEngine } from '@/core/engine';
+import { participants as participantsTable } from '@/db/schema';
+import type { SessionCreateOptions } from '@/core/session-factory';
 
 describe('会议控制', () => {
-  it('pause 停止循环，状态 paused；resume 从断点继续并沿用 resume 链', async () => {
-    const { db, engine, runner, meetingId } = setup(4);
-    const release = gateAt(runner, 2); // 第二个 agent 回合阻塞，等我们暂停后再放行
-    const p = engine.start(meetingId);
-    // 第一个 agent 发言完成、第二个回合被挂起
-    await vi.waitFor(() => expect(speechCount(db)).toBe(1));
-    engine.pause(meetingId);
-    release();
-    await p;
-    expect(db.select().from(meetings).where(eq(meetings.id, meetingId)).all()[0].status)
-      .toBe('paused');
-    expect(speechCount(db)).toBe(2); // 被挂起的回合完成后停止，不进入第 2 轮
-
-    // 继续：从第 2 轮开始，最终跑满 4 轮
-    const p2 = engine.resume(meetingId);
-    await p2;
-    expect(speechCount(db)).toBe(8); // 4 轮 × 2 人
-    // 后续回合透传了 session id（dev 第 2 轮 resume 其第 1 轮的会话）
-    expect(runner.mock.calls[2][0].resumeSessionId).toBe('s-1');
+  it('pause：关闭全部会话、状态 paused；期间消息只落库不推送', async () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    await engine.pause(m.id);
+    expect(sessions.every((s) => s.closed)).toBe(true);
+    expect(engine.getMeeting(m.id).status).toBe('paused');
+    sessions.forEach((s) => (s.pushes = []));
+    engine.sendUserMessage(m.id, '暂停期间的消息');
+    expect(sessions.every((s) => s.pushes.length === 0)).toBe(true);
+    expect(engine.getMessages(m.id).some((x) => x.content === '暂停期间的消息')).toBe(true);
   });
 
-  it('end 置 ended 并停止循环，ended 后 start 抛错', async () => {
-    const { db, engine, meetingId } = setup(4);
-    const p = engine.start(meetingId);
-    await vi.waitFor(() => expect(speechCount(db)).toBeGreaterThanOrEqual(1));
-    engine.end(meetingId);
-    await p;
-    const m = db.select().from(meetings).where(eq(meetings.id, meetingId)).all()[0];
-    expect(m.status).toBe('ended');
-    expect(m.endedAt).toBeTruthy();
-    expect(() => engine.start(meetingId)).toThrow(/结束/);
+  it('resume：重建会话并补发暂停期间增量', async () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    // 第一个成员有 sessionId（模拟已跑过）：resume 应接续原会话链
+    sessions[0].opts.callbacks.onSessionId('s-keep');
+    await engine.pause(m.id);
+    engine.sendUserMessage(m.id, '暂停期间的重要消息');
+    const before = sessions.length;
+    await engine.resume(m.id);
+    expect(sessions.length).toBe(before + 2); // 全部重建
+    const rebuilt = sessions[sessions.length - 2];
+    expect(rebuilt.opts.resumeSessionId).toBe('s-keep');
+    expect(rebuilt.pushes[0].text).toContain('暂停期间的重要消息');
+    expect(rebuilt.pushes[0].text).toContain('继续进行');
+    // 另一成员无 sessionId → 全新会话
+    expect(sessions[sessions.length - 1].opts.resumeSessionId).toBeUndefined();
   });
 
-  it('extendRounds 增加轮数上限', async () => {
-    const { db, engine, meetingId } = setup(1);
-    const p = engine.start(meetingId);
-    await p; // 跑满 1 轮自动 paused
-    engine.extendRounds(meetingId, 2);
-    expect(db.select().from(meetings).where(eq(meetings.id, meetingId)).all()[0].maxRounds)
-      .toBe(3);
-    const p2 = engine.resume(meetingId);
-    await p2;
-    expect(speechCount(db)).toBe(6); // 3 轮 × 2 人
+  it('end：关闭会话、落库结束消息、拒绝再操作', async () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    await engine.end(m.id);
+    expect(sessions.every((s) => s.closed)).toBe(true);
+    expect(engine.getMeeting(m.id).status).toBe('ended');
+    expect(engine.getMessages(m.id).some((x) => x.content.includes('已结束'))).toBe(true);
+    expect(() => engine.sendUserMessage(m.id, 'x')).toThrow(/结束/);
+    expect(() => engine.start(m.id)).toThrow(/结束/);
+  });
+
+  it('崩溃重建：onRestart 后按水位线补发增量（开区间，不重发已送达）', () => {
+    const { db, engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    const ps = engine.getParticipants(m.id);
+    sessions.forEach((s) => (s.pushes = []));
+    const delivered = engine.sendUserMessage(m.id, '正常送达的消息A');
+    engine.sendUserMessage(m.id, '崩溃丢失的消息B1');
+    engine.sendUserMessage(m.id, '崩溃丢失的消息B2');
+    // active 广播同步推进水位线；回拨到最后一条已送达消息，构造
+    // 「A 已送达、B1/B2 崩溃窗口丢失」的等价状态（验证 gt 开区间）
+    db.update(participantsTable)
+      .set({ lastInjectedMsgId: delivered.id })
+      .where(eq(participantsTable.id, ps[0].id)).run();
+    sessions[0].pushes = [];
+    sessions[0].opts.callbacks.onRestart();
+    expect(sessions[0].pushes.length).toBe(1);
+    const text = sessions[0].pushes[0].text;
+    expect(text).toContain('关注后续推送');
+    expect(text).toContain('崩溃丢失的消息B1');
+    expect(text).toContain('崩溃丢失的消息B2');
+    expect(text.indexOf('崩溃丢失的消息B1')).toBeLessThan(text.indexOf('崩溃丢失的消息B2')); // 增量有序
+    expect(text).not.toContain('正常送达的消息A'); // 已送达不重发（gt 非 gte）
+  });
+
+  it('重建也失败：onDead → offline 状态，会议不受影响', () => {
+    // 完整摘除/水位线不推进/重建行为见 engine-crash.test.ts，此处仅锁定会议控制组视角
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    expect(() => sessions[0].opts.callbacks.onDead()).not.toThrow();
+    expect(engine.getMeeting(m.id).status).toBe('active');
+  });
+
+  it('暂停穿透拦截：paused 后迟到的 chatroom 回合结果不落库、不广播、零新消息', async () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    await engine.pause(m.id);
+    sessions.forEach((s) => (s.pushes = []));
+    // session 已关闭，但飞行中回合的 onResult 仍可能触发（close 无门卫时的在途回调）
+    const before = engine.getMessages(m.id).length;
+    sessions[0].opts.callbacks.onResult('暂停后迟到的发言', 'chatroom');
+    // 静默规格：不产生任何新消息（含系统提示），违规原文不落库
+    expect(engine.getMessages(m.id).length).toBe(before);
+    expect(engine.getMessages(m.id).some((x) => x.content === '暂停后迟到的发言')).toBe(false);
+    expect(sessions.every((s) => s.pushes.length === 0)).toBe(true);
+  });
+});
+
+describe('动态成员管理', () => {
+  it('active 会议添加成员：落库、入会消息、建会话并推送全部历史', () => {
+    const { engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    engine.sendUserMessage(m.id, '第一条历史');
+    const before = sessions.length;
+    const row = engine.addParticipant(m.id, {
+      templateId: 'architect', displayName: '王架构', goal: '全局视角把控',
+    });
+    expect(engine.getParticipants(m.id).length).toBe(3);
+    expect(engine.getMeeting(m.id).status).toBe('active');
+    expect(sessions.length).toBe(before + 1);
+    const joinPush = sessions[sessions.length - 1].pushes[0].text;
+    expect(joinPush).toContain('王架构');
+    expect(joinPush).toContain('中途加入');
+    expect(joinPush).toContain('[chatroom 用户] 第一条历史'); // 全部历史（水位线 0）
+    const p = engine.getParticipant(m.id, row.id);
+    const maxId = Math.max(...engine.getMessages(m.id).map((x) => x.id));
+    expect(p.lastInjectedMsgId).toBe(maxId);
+  });
+
+  it('paused 会议添加成员：仅落库（resume 时统一重建）', () => {
+    const { engine, m, sessions } = setupEngine();
+    const before = sessions.length;
+    engine.addParticipant(m.id, {
+      templateId: 'analyst', displayName: '赵分析', goal: '数据支撑',
+    });
+    expect(sessions.length).toBe(before); // 没有新会话
+    expect(engine.getParticipants(m.id).length).toBe(3);
+  });
+
+  it('上限与校验：空名字拒绝、第 9 人拒绝、ended 拒绝', async () => {
+    const { engine, m } = setupEngine();
+    // 空名字须在人数未满时验证：engine 校验顺序为 ended → 上限 → 名字 → 模板，
+    // 满员后空名字会先命中上限异常，到不了名字校验
+    expect(() => engine.addParticipant(m.id, {
+      templateId: 'dev', displayName: '', goal: 'g',
+    })).toThrow(/名字/);
+    for (let i = 0; i < 6; i++) {
+      engine.addParticipant(m.id, {
+        templateId: 'dev', displayName: `成员${i}`, goal: 'g',
+      });
+    }
+    expect(() => engine.addParticipant(m.id, {
+      templateId: 'dev', displayName: '超了', goal: 'g',
+    })).toThrow(/8/);
+    await engine.end(m.id);
+    expect(() => engine.addParticipant(m.id, {
+      templateId: 'dev', displayName: 'x', goal: 'g',
+    })).toThrow(/结束/);
+  });
+
+  it('setMuted：更新并广播 participant 事件', () => {
+    const { engine, m } = setupEngine();
+    const ps = engine.getParticipants(m.id);
+    const updated = engine.setMuted(m.id, ps[0].id, true);
+    expect(updated.muted).toBe(1);
+    expect(engine.getParticipant(m.id, ps[0].id).muted).toBe(1);
+  });
+});
+
+describe('服务器重启恢复', () => {
+  it('recoverActiveMeetings：重启 engine 后 active 会议自动重建会话；paused 不在范围', async () => {
+    const { db, engine, m, sessions } = setupEngine();
+    engine.start(m.id);
+    sessions[0].opts.callbacks.onSessionId('s-recover');
+    engine.sendUserMessage(m.id, '重启前的消息');
+    // 与崩溃重建用例同构：active 期间广播同步推进了水位线，重启窗口「消息已落库
+    // 但未送达」的等价状态是水位线未推进——回拨构造以验证恢复补发路径
+    const ps = engine.getParticipants(m.id);
+    db.update(participantsTable)
+      .set({ lastInjectedMsgId: 0 })
+      .where(eq(participantsTable.id, ps[0].id)).run();
+    // 模拟重启：旧 engine 的内存会话消失，新 engine 实例（同一 db）
+    const created2: FakeSession[] = [];
+    const engine2 = new MeetingEngine(db, {
+      create: (opts: SessionCreateOptions) => {
+        const s = new FakeSession(opts);
+        created2.push(s);
+        return s;
+      },
+    });
+    engine2.recoverActiveMeetings();
+    expect(created2.length).toBe(2);
+    expect(created2[0].opts.resumeSessionId).toBe('s-recover');
+    expect(created2[0].pushes[0].text).toContain('重启前的消息');
+    // paused 会议不在恢复范围
+    const pausedEnv = setupEngine();
+    const created3: FakeSession[] = [];
+    const engine3 = new MeetingEngine(pausedEnv.db, {
+      create: (opts: SessionCreateOptions) => {
+        const s = new FakeSession(opts);
+        created3.push(s);
+        return s;
+      },
+    });
+    engine3.recoverActiveMeetings();
+    expect(created3.length).toBe(0);
   });
 });

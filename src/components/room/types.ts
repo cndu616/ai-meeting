@@ -1,11 +1,16 @@
+// src/components/room/types.ts
 import type { MeetingRow, MessageRow } from '@/db/schema';
+import type { AgentStatus, ParticipantInfo } from '@/lib/events';
 
-export interface ParticipantView {
+export interface TemplateInfo {
   id: string;
-  agentId: string;
-  meetingRole: string;
-  agent: { id: string; name: string; capability: string; avatar: string; description: string };
+  capability: string;
+  description: string;
+  avatar: string;
 }
+
+/** 语义别名：展示字段已由 ParticipantInfo 自足，供 UI 组件 props 引用 */
+export type ParticipantView = ParticipantInfo;
 
 export interface RoomData {
   meeting: MeetingRow;
@@ -13,4 +18,4 @@ export interface RoomData {
   messages: MessageRow[];
 }
 
-export type AgentState = 'idle' | 'thinking' | 'tool' | 'speaking';
+export type { AgentStatus };

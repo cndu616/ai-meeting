@@ -2870,6 +2870,8 @@ npm run dev
 7. 暂停 → 继续：会话重建、补发暂停期间消息。
 8. 结束：按钮变灰、聊天室出现结束系统消息；刷新页面历史完整回放。
 9. 重启 dev server（active 会议存在时）：引擎自动恢复会话。
+10. DM 通道正确性（uuid 绑定的真实行为）：快速连续给同一成员发聊天室消息+私信（构造 SDK batch 合并）→ 私信回复绝不进聊天室；观察某成员长工具循环触发 `error_max_turns` 后，其后续回复通道不错位。
+11. 崩溃鲁棒性（可选）：会议进行中 kill 某成员的 CLI 子进程 → 自动重建（onRestart→catchUp 补发增量）；再 kill 一次 → 掉线标记、会议不受影响。
 
 验证中发现问题：小问题当场修并补测试；架构级问题停下来与用户讨论。
 
@@ -2881,8 +2883,36 @@ git add -A && git commit -m "test: 全量验证通过；E2E 手测自由响应�
 
 ---
 
+## 实现勘误（Task 3 代码审查后修订）
+
+Task 3 的计划代码块经代码审查发现三处缺陷，已在 commit `0a41dc8` 修复——**后续任务以 `src/core/agent-session.ts` 实际代码为准，勿照抄本计划 Task 3 Step 3 的代码块**：
+
+1. **handleEnd 顺序修正**：先 `start()`（换新队列）再回调 `onRestart()`——原顺序下 engine 的 catchUp 补发会写入已死的旧队列（消息永久丢失且水位线已推进）。
+2. **result 分支放宽**：`msg.type === 'result'` 任意 subtype 都出队销账；非 success 文本按空串 `onResult('', kind)`——error result（error_max_turns 等）同样是 turn 完成信号，只在 success 出队会让 DM 标记错位。
+3. **DM 通道改用 uuid 绑定**（取代 pendingKinds 顺序数组）：push 时生成 uuid 记入 `Map<uuid, PushKind>`（SDKUserMessage 带 uuid 字段），result 按 `user_message_uuids`（prompt batch 合并时含全部成员 uuid）逐个销账，**含任一 dm 则按 dm 归并**（宁漏播不泄漏）；单数 `user_message_uuid` 次之；均缺失时按插入序回退（旧 producer 兼容）。SDK 文档（sdk.d.ts）确认 host 传入的 uuid 会被回显。另：consume 收到 init 时复位 `restarted`（连续失败才放弃）、catch 不再静默、onRestart/onDead 回调包 try/catch 防逃逸、close 为「请求关闭」语义（不等待当前 turn）。
+
+对 engine 的影响：`AgentSessionCallbacks` 接口签名不变，Task 4 的 engine 代码无需调整；onRestart 触发时新队列已就绪，catchUp 可安全 push。
+
+**Task 4 勘误**（commit `ebd3cf9` 修复，计划 engine.ts 参考代码中的两处缺陷，后续任务以实际代码为准）：
+
+4. **onDead 必须摘除会话**：`createSessionFor` 的 onDead 里先 `this.sessionsOf(meetingId).delete(p.id)` 再置 offline——否则死会话残留在 Map：广播继续推死队列且推进水位线（消息永久丢失）、sendDm 走常驻分支丢私信、start() 的 has 检查挡住恢复重建。已由 `tests/engine-crash.test.ts` 锁定。
+5. **runDmOffline 的 onRestart 必须重发私信**（`session.push(buildDmPrompt(content), 'dm')`，利用勘误 1 的「新队列已就绪」契约）且 gate 需 120s 超时兜底（`DM_OFFLINE_TIMEOUT_MS` + settled/finish 防双落定）——否则暂停态私信推送后崩溃重建，gate 永挂（API Promise 不落定）。计划代码中 `onRestart: () => {}` 为缺陷。
+6. **insertMessage 用 `.returning().all()` 取 [0]** 取代全表重查取末位（正确性不再依赖 SQLite 返回顺序）。
+
+另：Task 6 派发时补一条 fake-timer 超时用例（120s 超时落 system 消息 → close → idle）。
+
+**Task 7 勘误**（计划测试代码两处必红构造，implementer 发现并修正）：
+
+7. **「崩溃重建」用例的水位线构造**：active 期间广播同步推进水位线 → onRestart 时 catchUp 增量恒空，计划用例断言 `toContain('崩溃前的消息')` 必败。修正：测试回拨 `lastInjectedMsgId` 构造「消息已落库但未送达」等价状态（recover 用例同理，回拨到 0）。另：上限校验用例须在加满 8 人**之前**测空名字（engine 校验顺序 ended→上限→名字，否则先命中上限）。
+
+**Task 9 勘误**（C1 级架构修正，commit `dfb774c`）：
+
+8. **ParticipantInfo 携带 capability/avatar（事件视图自足）**：计划中 SSE participant 事件与 POST 201 投影只带 ParticipantInfo（无 capability/avatar），Room 的 upsert 追加分支 append 后新成员卡片头像/岗位空白；且 `JSON.parse` 返回 any，类型系统拦不住协议缺字段。修正：`ParticipantInfo` 增加 capability/avatar，`engine.participantInfo()` 统一 join 模板作为单一事实来源，页面投影/两路由/SSE 事件全部复用；`types.ts` 的 `ParticipantView` 改为 ParticipantInfo 的 type 别名；Room 内 `JSON.parse(...) as MeetingEvent` 收窄。计划 Task 9 Step 1/Step 8 的参考代码以此为准。
+
+**Task 10 E2E 结论**（真实 SDK，curl 自动化）：11 项清单中 1-10 全部验证通过——含 uuid 绑定 DM 通道（聊天室+私信快速连发，回复零泄漏）、暂停→resume 补发（暂停期间消息恢复后全员响应）、动态加人（水位线 0 全量历史+自我介绍）、禁言生效/解除恢复、服务器冷重启 recoverActiveMeetings（成员确认「上下文完整」）。第 11 项（kill 单个 CLI 进程）标可选未执行：进程树级冷重启已覆盖更极端场景，单会话崩溃重建路径由 8 个单元测试锁定。
+
 ## 风险与回退
 
-- **SDK streaming 行为不符预期**（如 push 不触发 turn、result 不逐条对应）：Task 3 的 AgentSession 测试先行暴露；E2E（Task 10）最终验证真实行为。若 push:result 一一对应假设被证伪，回退方案是在 AgentSession 内改用「文本自标记」（DM 指令要求回复以固定前缀开头）。
+- **SDK streaming 行为不符预期**（如 push 不触发 turn、result 不逐条对应）：Task 3 的 AgentSession 测试先行暴露；E2E（Task 10）最终验证真实行为。~~若 push:result 一一对应假设被证伪，回退方案是「文本自标记」~~——已由 uuid 绑定机制解决（见上方实现勘误第 3 条），真实 CLI 的 batch 合并行为仍需 E2E 观察确认。
 - **同一消息重复补发**（崩溃瞬间）：可接受——LLM 上下文重复一条消息无害。
 - **回退**：本计划是纯重构，git revert 各任务提交即可回到 v1。
